@@ -17,7 +17,7 @@ jobs:
   dco:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           # Need both sides of the range to enumerate the PR's commits.
           fetch-depth: 0
@@ -48,23 +48,15 @@ jobs:
             fi
 
             # Bots cannot agree to the DCO; their commits are covered by the allowlist
-            # in the CLA workflow instead. Our own platform agents commit through the
-            # aixle-com GitHub App, but not every one of their identities carries the
-            # `[bot]` suffix — match our service-account domains too, since those
-            # commits are the company's own output.
+            # in the CLA workflow instead.
             case "$author_name" in
               *'[bot]')
                 echo "skip     $sha (bot author: $author_name)"
                 continue
                 ;;
             esac
+
             author_email=$(printf '%s' "$author_email" | tr '[:upper:]' '[:lower:]')
-            case "$author_email" in
-              *'@aixle.com' | *'@aixle.local' | *'@aixle.bot' | *'@palad.ai')
-                echo "skip     $sha (service account: $author_email)"
-                continue
-                ;;
-            esac
             # Every Signed-off-by email in the body, one per line, lowercased.
             signoffs=$(printf '%s\n' "$body" \
               | grep -iE '^[[:space:]]*Signed-off-by:[[:space:]]*.+<.+@.+>' \
