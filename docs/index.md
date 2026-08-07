@@ -43,6 +43,7 @@ The active workflow: a research report in `research/` feeds a frozen-intent spec
 - **[planning-artifacts/research/](./planning-artifacts/research/)** — BMAD-workflow research reports (same pipeline role as `research/`, produced by the `bmad-technical-research` skill)
   - **[planning-artifacts/research/technical-mcp-connector-catalog-research-2026-08-01.md](./planning-artifacts/research/technical-mcp-connector-catalog-research-2026-08-01.md)** — Registry-backed MCP connector catalog: Official MCP Registry integration, `server.json` → `MCPServer` mapping, mirror-vs-proxy decision, security posture without an allowlist, phased roadmap
   - **[planning-artifacts/research/technical-skills-catalog-featured-and-manual-add-research-2026-08-03.md](./planning-artifacts/research/technical-skills-catalog-featured-and-manual-add-research-2026-08-03.md)** — Skills page parity with the connector catalog: skills.sh API reachability (v1 is OIDC-only), mirror-for-browse vs live-search inversion, install-count ranking with measured bulk-publisher inflation, manual `SKILL.md` authoring, CLI-telemetry egress finding, phased roadmap. Includes an addendum from reading the CLI's own source (public audit host, well-known discovery for non-GitHub publishers)
+  - **[planning-artifacts/research/technical-mcp-oauth-discovery-in-the-wild-research-2026-08-07.md](./planning-artifacts/research/technical-mcp-oauth-discovery-in-the-wild-research-2026-08-07.md)** — What the catalog's remote MCP servers actually support for OAuth, measured over 178 hosts: Vercel's DCR approves loopback callbacks only (root cause of "couldn't connect"), DCR advertised by 96% but advertisement ≠ acceptance, CIMD at 20%, device flow at 9%, plus two bugs of ours — a probe shape that loses `WWW-Authenticate` on a fifth of hosts, and a protected-resource fallback that is not RFC 9728 path-aware
 - **[implementation-artifacts/](./implementation-artifacts/)** — BMAD quick-dev specs: frozen-intent block + Code Map / Tasks / Spec Change Log / Verification, plus `deferred-work.md` for findings split out of a spec
   - **[implementation-artifacts/spec-skills-catalog.md](./implementation-artifacts/spec-skills-catalog.md)** — Skills catalog: featured browse, `catalog_skills` mirror with a weekly seeded sweep, manual `SKILL.md` authoring, audit badges
   - **[implementation-artifacts/spec-multi-company-membership.md](./implementation-artifacts/spec-multi-company-membership.md)** — Multi-company membership
@@ -52,6 +53,11 @@ The active workflow: a research report in `research/` feeds a frozen-intent spec
 ## Strategy
 
 - **[strategy/](./strategy/)** — Business / open-source strategy documents
+
+## Legal
+
+- **[legal/TERMS_OF_SERVICE.md](./legal/TERMS_OF_SERVICE.md)** — Aixle Flow Terms of Service; published verbatim at `/terms-of-service` (`app/views/web/pages/terms_of_service.html.erb`)
+- **[legal/PRIVACY_POLICY.md](./legal/PRIVACY_POLICY.md)** — Aixle Flow Privacy Policy; published verbatim at `/privacy-policy` (`app/views/web/pages/privacy_policy.html.erb`)
 
 ## Related documentation elsewhere
 
