@@ -73,6 +73,33 @@ module Coder
       assert     @service.held?(workspace_name: "ws-3")
     end
 
+    test "release_owned deletes the row only for the holding session" do
+      @service.acquire(**lock_args(terminal_session_id: "sess-A"))
+
+      assert_not @service.release_owned(workspace_name: "ws-1", terminal_session_id: "sess-B")
+      assert @service.held?(workspace_name: "ws-1"), "another session must not be able to release the lock"
+
+      assert @service.release_owned(workspace_name: "ws-1", terminal_session_id: "sess-A")
+      assert_not @service.held?(workspace_name: "ws-1")
+    end
+
+    test "release_owned keeps a lock that another session reclaimed after expiry" do
+      create(
+        :integration_data, :expired,
+        integration: @integration,
+        key:         "coder:workspace_lock:ws-1",
+        value:       { terminal_session_id: "sess-A", workspace_id: "u1" }
+      )
+      @service.acquire(**lock_args(terminal_session_id: "sess-B"))
+
+      assert_not @service.release_owned(workspace_name: "ws-1", terminal_session_id: "sess-A")
+      assert @service.held_by_session?(workspace_name: "ws-1", terminal_session_id: "sess-B")
+    end
+
+    test "release_owned is idempotent on missing rows" do
+      assert_not @service.release_owned(workspace_name: "missing", terminal_session_id: "sess-A")
+    end
+
     test "held_by_session? returns true only for the holder" do
       @service.acquire(**lock_args(terminal_session_id: "sess-A"))
 
@@ -97,12 +124,12 @@ module Coder
       assert other_service.held?(workspace_name: "ws-1")
     end
 
-    test "uses default 60-minute TTL when integration has no override" do
+    test "uses default 120-minute TTL when integration has no override" do
       @integration.settings = (@integration.settings || {}).merge("lock_ttl_minutes" => nil)
       @integration.save!
 
       row = @service.acquire(**lock_args)
-      assert_in_delta 60.minutes.from_now.to_i, row.expires_at.to_i, 5
+      assert_in_delta 120.minutes.from_now.to_i, row.expires_at.to_i, 5
     end
 
     test "release_all_for_session iterates every active Coder integration in scope" do
