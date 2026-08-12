@@ -30,8 +30,8 @@ describe('SessionNewForm', () => {
     expect(screen.getByText('Codex')).toBeInTheDocument();
     expect(screen.getByText('Gemini CLI')).toBeInTheDocument();
 
-    // With no configured agents, every card shows a "Setup needed" badge.
-    expect(screen.getAllByText('Setup needed')).toHaveLength(4);
+    // With no configured agents, every runtime tile is marked as needing setup.
+    expect(screen.getAllByText('Setup')).toHaveLength(4);
 
     // Start is disabled because no agent can be selected.
     expect(screen.getByRole('button', { name: /start session/i })).toBeDisabled();
@@ -140,7 +140,7 @@ describe('SessionNewForm', () => {
 
     await user.click(screen.getByText('Claude Code'));
     // Switch to Automatic (non_interactive) execution mode.
-    await user.click(screen.getByRole('radio', { name: 'Automatic' }));
+    await user.click(screen.getByRole('radio', { name: /Automatic/ }));
 
     const startBtn = screen.getByRole('button', { name: /start session/i });
     expect(startBtn).toBeDisabled();
