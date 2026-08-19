@@ -8,7 +8,8 @@ class QuotaErrorDetector
       /credit balance(?:\s+is)?\s+too low/i,
       /insufficient_quota/i,
       /billing_hard_limit/i,
-      /Add funds:.*platform\.claude\.com/i
+      /Add funds:.*platform\.claude\.com/i,
+      /individual spend limit/i
     ],
     gemini: [
       /Usage limit reached/i,
@@ -30,6 +31,16 @@ class QuotaErrorDetector
       /you'?re out of usage/i,
       /increase your limit to continue/i,
       /usage limit has been reached/i
+    ],
+    # Grok CLI's own rendered limit messages, plus the phrases it classifies a
+    # quota/billing rejection by ("out of credits", "usage balance exhausted").
+    xai: [
+      /out of credits/i,
+      /usage balance exhausted/i,
+      /Add credits and retry/i,
+      /You'?ve hit the rate limit for your plan/i,
+      /You hit your (?:weekly|free usage) limit/i,
+      /Purchase credits to keep using Grok/i
     ]
   }.freeze
 

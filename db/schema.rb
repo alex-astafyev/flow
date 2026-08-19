@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_17_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "citext"
   enable_extension "pg_catalog.plpgsql"
@@ -288,6 +288,18 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
     t.index ["user_id", "company_id"], name: "index_company_memberships_on_user_id_and_company_id", unique: true
   end
 
+  create_table "config_item_accesses", force: :cascade do |t|
+    t.bigint "config_item_id", null: false
+    t.string "config_item_name", null: false
+    t.datetime "created_at", null: false
+    t.string "item_type", null: false
+    t.bigint "terminal_session_id", null: false
+    t.bigint "user_id"
+    t.index ["config_item_id"], name: "index_config_item_accesses_on_config_item_id"
+    t.index ["created_at"], name: "index_config_item_accesses_on_created_at"
+    t.index ["terminal_session_id"], name: "index_config_item_accesses_on_terminal_session_id"
+  end
+
   create_table "config_items", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.text "description"
@@ -332,8 +344,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
     t.bigint "board_task_id", null: false
     t.datetime "created_at", null: false
     t.bigint "creator_id"
+    t.string "diagnostic_reason"
+    t.datetime "expires_at", null: false
     t.string "gate_type", null: false
+    t.datetime "last_reconciled_at"
     t.jsonb "metadata", default: {}, null: false
+    t.integer "reconcile_attempts", default: 0, null: false
+    t.jsonb "reconciliation_log", default: [], null: false
     t.jsonb "resolution_data", default: {}, null: false
     t.datetime "resolved_at"
     t.string "status", default: "pending", null: false
@@ -345,6 +362,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
     t.index ["board_task_id"], name: "index_gates_on_board_task_id"
     t.index ["creator_id"], name: "index_gates_on_creator_id"
     t.index ["gate_type", "status"], name: "index_gates_on_gate_type_and_status"
+    t.index ["status", "expires_at"], name: "index_gates_on_status_and_expires_at", where: "((status)::text <> 'resolved'::text)"
     t.index ["status"], name: "index_gates_on_status"
   end
 
@@ -476,6 +494,16 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
     t.index ["user_id"], name: "index_project_collaborators_on_user_id"
   end
 
+  create_table "project_favorites", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "project_id", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["project_id"], name: "index_project_favorites_on_project_id"
+    t.index ["user_id", "project_id"], name: "index_project_favorites_on_user_id_and_project_id", unique: true
+    t.index ["user_id"], name: "index_project_favorites_on_user_id"
+  end
+
   create_table "projects", force: :cascade do |t|
     t.bigint "company_id", null: false
     t.datetime "created_at", null: false
@@ -524,6 +552,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
     t.index ["scope_type", "scope_id", "full_name"], name: "idx_repositories_scope_full_name", unique: true
     t.index ["scope_type", "scope_id"], name: "index_repositories_on_scope_type_and_scope_id"
     t.index ["webhook_secret"], name: "index_repositories_on_webhook_secret", unique: true
+  end
+
+  create_table "session_config_items", id: false, force: :cascade do |t|
+    t.bigint "config_item_id", null: false
+    t.bigint "terminal_session_id", null: false
+    t.index ["config_item_id"], name: "index_session_config_items_on_config_item_id"
+    t.index ["terminal_session_id", "config_item_id"], name: "index_session_config_items_on_session_and_item", unique: true
   end
 
   create_table "session_input_assets", id: false, force: :cascade do |t|
@@ -735,6 +770,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
     t.boolean "allow_non_interactive", default: false, null: false
     t.jsonb "asset_ids", default: [], null: false
     t.boolean "bmad_enabled", default: false, null: false
+    t.jsonb "config_item_ids", default: [], null: false
     t.datetime "created_at", null: false
     t.datetime "deleted_at"
     t.jsonb "depends_on_step_ids", default: [], null: false
@@ -1011,6 +1047,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
     t.datetime "deleted_at"
     t.citext "email", null: false
     t.bigint "last_company_id"
+    t.jsonb "mcp_enabled_tools"
     t.string "mcp_token_digest"
     t.datetime "mcp_token_last_used_at"
     t.string "name", null: false
@@ -1148,6 +1185,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_08_130000) do
   add_foreign_key "oauth_credentials", "oauth_clients"
   add_foreign_key "project_collaborators", "projects"
   add_foreign_key "project_collaborators", "users"
+  add_foreign_key "project_favorites", "projects"
+  add_foreign_key "project_favorites", "users"
   add_foreign_key "projects", "companies"
   add_foreign_key "projects", "users", column: "owner_id"
   add_foreign_key "received_webhooks", "webhook_endpoints", on_delete: :cascade

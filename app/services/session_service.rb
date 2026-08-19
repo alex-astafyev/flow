@@ -31,7 +31,8 @@ class SessionService
         configured_agent: configured_agent,
         metadata: metadata.presence,
         **params.slice(:mode, :initial_prompt, :requested_model, :session_config,
-                       :tool_ids, :skill_ids, :mcp_server_ids, :input_asset_ids, :repository_ids)
+                       :tool_ids, :skill_ids, :mcp_server_ids, :input_asset_ids, :repository_ids,
+                       :config_item_ids)
       )
 
       return session unless session.save
@@ -125,6 +126,7 @@ class SessionService
       config = SessionConfigResolver.resolve(session)
       session.update!(agent_type: config[:agent_runtime], mode: config[:mode])
       attach_resolved_resources(session, config)
+      refresh_oauth_tokens_for_session(session)
       session.start! if session.may_start?
       start_temporal_workflow(session)
 
@@ -157,6 +159,26 @@ class SessionService
       servers = MCPServer.where(id: mcp_server_ids, enabled: true)
       missing = Oauth::Preflight.missing_connections(servers, user: user)
       raise Oauth::PreflightError, missing if missing.any?
+
+      # Proactively refresh tokens expiring within 1 hour so inject_oauth_token!
+      # (one-shot at provisioning) gets a token valid for the session's lifetime.
+      servers.each do |server|
+        next unless server.auth_type_oauth?
+
+        owner = server.credential_scope_per_user? ? user : server.scope
+        next if owner.nil?
+
+        cred = OauthCredential.for_mcp_server(server).for_owner(owner)
+                              .where.not(status: :revoked).order(updated_at: :desc).first
+        next if cred.nil?
+
+        Oauth::TokenService.refresh_if_expiring_soon(cred)
+        cred.reload
+        if cred.error?
+          raise Oauth::PreflightError, [ { mcp_server_id: server.id, reason: :credential_error,
+                                           connect_url: "/oauth/mcp/#{server.id}/connect" } ]
+        end
+      end
     end
 
     # Raises CloudAuth::PreflightError when the cloud connection this session would use
@@ -232,6 +254,31 @@ class SessionService
       TemporalService.cancel_workflow(session.workflow_id)
     rescue StandardError => e
       Rails.logger.error("[SessionService] Failed to cancel workflow for session #{session.id}: #{e.message}")
+    end
+
+    def refresh_oauth_tokens_for_session(session)
+      session.mcp_servers.each do |server|
+        next unless server.auth_type_oauth?
+
+        owner = server.credential_scope_per_user? ? session.user : server.scope
+        next if owner.nil?
+
+        cred = OauthCredential.for_mcp_server(server).for_owner(owner)
+                              .where.not(status: :revoked).order(updated_at: :desc).first
+        next if cred.nil?
+
+        if cred.error?
+          raise Oauth::PreflightError, [ { mcp_server_id: server.id, reason: :credential_error,
+                                           connect_url: "/oauth/mcp/#{server.id}/connect" } ]
+        end
+
+        Oauth::TokenService.refresh_if_expiring_soon(cred)
+        cred.reload
+        if cred.error?
+          raise Oauth::PreflightError, [ { mcp_server_id: server.id, reason: :credential_error,
+                                           connect_url: "/oauth/mcp/#{server.id}/connect" } ]
+        end
+      end
     end
 
     def attach_resolved_resources(session, config)

@@ -25,6 +25,70 @@ module Api
           assert_response :success
         end
 
+        test "index pages one column and reports its unpaginated total" do
+          create_list(:board_task, 3, board: @board, board_column: @col1)
+          create(:board_task, board: @board, board_column: @col2)
+
+          get :index, params: { project_id: @project.id, board_column_id: @col1.id, limit: 2, offset: 0 }
+
+          assert_response :success
+          body = JSON.parse(response.body)
+          assert_equal 2, body.length
+          # @task plus the three above; the header is what lets the column header show a real total
+          # while holding one page.
+          assert_equal "4", response.headers["X-Total-Count"]
+          assert(body.all? { |t| t["boardColumnId"] == @col1.id })
+        end
+
+        test "index pages in board order without repeating a task across pages" do
+          tasks = 3.times.map { |i| create(:board_task, board: @board, board_column: @col2, position: i) }
+
+          get :index, params: { project_id: @project.id, board_column_id: @col2.id, limit: 2, offset: 0 }
+          first_page = JSON.parse(response.body).map { |t| t["id"] }
+          get :index, params: { project_id: @project.id, board_column_id: @col2.id, limit: 2, offset: 2 }
+          second_page = JSON.parse(response.body).map { |t| t["id"] }
+
+          assert_equal tasks.map(&:id), first_page + second_page
+        end
+
+        test "index filters by the ransack predicates the board sends" do
+          assignee = @user
+          match = create(:board_task, board: @board, board_column: @col1, title: "Fix login crash",
+            task_type: :bug, priority: :high, assignee: assignee)
+          create(:board_task, board: @board, board_column: @col1, title: "Build settings page", task_type: :story)
+
+          get :index, params: {
+            project_id: @project.id,
+            q: { title_cont: "login", task_type_eq: "bug", priority_eq: "high", assignee_id_eq: assignee.id }
+          }
+
+          assert_response :success
+          assert_equal [ match.id ], JSON.parse(response.body).map { |t| t["id"] }
+          assert_equal "1", response.headers["X-Total-Count"]
+        end
+
+        test "index tags_match=all requires every tag, while the default still matches any" do
+          both = create(:board_task, board: @board, board_column: @col1, tags: %w[api ui])
+          one = create(:board_task, board: @board, board_column: @col1, tags: %w[api])
+
+          get :index, params: { project_id: @project.id, tags: %w[api ui], tags_match: "all" }
+          assert_equal [ both.id ], JSON.parse(response.body).map { |t| t["id"] }
+
+          get :index, params: { project_id: @project.id, tags: %w[api ui] }
+          assert_equal [ both.id, one.id ].sort, JSON.parse(response.body).map { |t| t["id"] }.sort
+        end
+
+        test "index archived=all returns active and archived tasks together" do
+          archived = create(:board_task, board: @board, board_column: @col1, archived_at: Time.current)
+
+          get :index, params: { project_id: @project.id, archived: "all" }
+
+          ids = JSON.parse(response.body).map { |t| t["id"] }
+          assert_includes ids, archived.id
+          assert_includes ids, @task.id
+          assert_equal "2", response.headers["X-Total-Count"]
+        end
+
         test "show returns task json" do
           get :show, params: { project_id: @project.id, id: @task.id }
 
@@ -207,6 +271,36 @@ module Api
           post :trigger_workflow, params: { project_id: @project.id, id: @task.id }
 
           assert_response :success
+        end
+
+        # The board card's column selector calls #move, so this guards the path the
+        # UI actually uses.
+        test "move into an auto-bound column starts that column's workflow" do
+          ColumnWorkflowBinding.create!(board_column: @col2, workflow: @workflow, trigger_mode: :auto, cooldown_seconds: 0)
+          WorkflowService.expects(:start).once.returns(create(:workflow_run, workflow: @workflow, project: @project, user: @user))
+
+          patch :move, params: { project_id: @project.id, id: @task.id, column_id: @col2.id }
+
+          assert_response :success
+          assert_equal @col2.id, @task.reload.board_column_id
+        end
+
+        # Regression: board_column_id is a permitted attribute here, so a plain
+        # PATCH used to relocate the card while skipping the transition record,
+        # the task_moved activity and the column's auto-trigger entirely.
+        test "update that changes the column moves the task, exactly as #move would" do
+          ColumnWorkflowBinding.create!(board_column: @col2, workflow: @workflow, trigger_mode: :auto, cooldown_seconds: 0)
+          WorkflowService.expects(:start).once.returns(create(:workflow_run, workflow: @workflow, project: @project, user: @user))
+
+          assert_difference -> { ColumnTransition.count }, 1 do
+            patch :update, params: {
+              project_id: @project.id, id: @task.id,
+              board_task: { board_column_id: @col2.id }
+            }
+          end
+
+          assert_response :success
+          assert_equal @col2.id, @task.reload.board_column_id
         end
 
         # === viewer (read-only) enforcement ===

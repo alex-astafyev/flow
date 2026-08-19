@@ -57,7 +57,6 @@ const buildCredential = (overrides: Partial<AgentCredential> = {}): AgentCredent
 const baseProps = (profile: SharedUser) => ({
   profile,
   languageOptions: ['en', 'es'],
-  mcp: { enabled: false, lastUsedAt: null, serverUrl: 'http://localhost:4000/mcp', token: null },
   agentModels: [],
 });
 
@@ -271,7 +270,7 @@ describe('Profile/Show', () => {
     expect(screen.getByText('No company memberships')).toBeInTheDocument();
   });
 
-  it('lists all four available agent runtimes with their names and descriptions', () => {
+  it('lists all five available agent runtimes with their names and descriptions', () => {
     const profile = buildProfile();
     renderAuthedPage(<ProfilePage {...baseProps(profile)} />, { props: baseProps(profile) });
 
@@ -279,6 +278,7 @@ describe('Profile/Show', () => {
     expect(screen.getByText('Cursor CLI')).toBeInTheDocument();
     expect(screen.getByText('OpenAI Codex')).toBeInTheDocument();
     expect(screen.getByText('Gemini CLI')).toBeInTheDocument();
+    expect(screen.getByText('Grok')).toBeInTheDocument();
     expect(screen.getByText("Anthropic's AI coding assistant with deep reasoning capabilities")).toBeInTheDocument();
   });
 
@@ -323,14 +323,14 @@ describe('Profile/Show', () => {
   });
 
   it('renders Authenticate (not Re-authenticate) for an agent that has no credential', () => {
-    // Only claude_code is configured; the other three should show Authenticate.
+    // Only claude_code is configured; the other four should show Authenticate.
     const credential = buildCredential({ id: 300, agentType: 'claude_code' });
     const profile = buildProfile({ configuredAgents: ['claude_code'], agentCredentials: [credential] });
     renderAuthedPage(<ProfilePage {...baseProps(profile)} />, { props: baseProps(profile) });
 
     expect(screen.getByRole('button', { name: 'Re-authenticate' })).toBeInTheDocument();
-    // The three unconfigured agents each render an Authenticate button.
-    expect(screen.getAllByRole('button', { name: 'Authenticate' })).toHaveLength(3);
+    // The four unconfigured agents each render an Authenticate button.
+    expect(screen.getAllByRole('button', { name: 'Authenticate' })).toHaveLength(4);
   });
 
   it('shows the session visibility switches in the state the profile reports', () => {
@@ -408,82 +408,6 @@ describe('Profile/Show', () => {
     expect(form.patch).not.toHaveBeenCalled();
   });
 
-  it('enables MCP by posting to the regenerate-token route when MCP is disabled', async () => {
-    const profile = buildProfile();
-    const props = {
-      ...baseProps(profile),
-      mcp: { enabled: false, lastUsedAt: null, serverUrl: 'http://localhost:4000/mcp', token: null },
-    };
-    renderAuthedPage(<ProfilePage {...props} />, { props });
-
-    // Disabled state: primary CTA reads "Enable MCP" and there is no Disable action yet.
-    expect(screen.queryByRole('button', { name: 'Disable' })).not.toBeInTheDocument();
-    expect(screen.queryByText(/MCP access is enabled/)).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole('button', { name: 'Enable MCP' }));
-
-    expect(router.post).toHaveBeenCalledWith(
-      '/profile/regenerate_mcp_token',
-      {},
-      expect.objectContaining({ preserveScroll: true }),
-    );
-  });
-
-  it('regenerates and disables the MCP token via the router when MCP is enabled', async () => {
-    const profile = buildProfile();
-    const props = {
-      ...baseProps(profile),
-      mcp: { enabled: true, lastUsedAt: '2026-03-01T12:00:00Z', serverUrl: 'http://localhost:4000/mcp', token: null },
-    };
-    renderAuthedPage(<ProfilePage {...props} />, { props });
-
-    // Enabled-without-token hint includes the last-used timestamp.
-    expect(screen.getByText(/MCP access is enabled/)).toHaveTextContent(/Last used/);
-
-    await userEvent.click(screen.getByRole('button', { name: 'Regenerate token' }));
-    expect(router.post).toHaveBeenCalledWith(
-      '/profile/regenerate_mcp_token',
-      {},
-      expect.objectContaining({ preserveScroll: true }),
-    );
-
-    await userEvent.click(screen.getByRole('button', { name: 'Disable' }));
-    expect(router.delete).toHaveBeenCalledWith(
-      '/profile/disable_mcp_token',
-      expect.objectContaining({ preserveScroll: true }),
-    );
-  });
-
-  it('shows the not-used-yet hint when MCP is enabled but has never been used', () => {
-    const profile = buildProfile();
-    const props = {
-      ...baseProps(profile),
-      mcp: { enabled: true, lastUsedAt: null, serverUrl: 'http://localhost:4000/mcp', token: null },
-    };
-    renderAuthedPage(<ProfilePage {...props} />, { props });
-
-    expect(screen.getByText(/MCP access is enabled/)).toHaveTextContent(/Not used yet/);
-  });
-
-  it('renders the one-time MCP token and the ready-to-paste Claude command when a token is present', () => {
-    const profile = buildProfile();
-    const props = {
-      ...baseProps(profile),
-      mcp: { enabled: true, lastUsedAt: null, serverUrl: 'http://localhost:4000/mcp', token: 'mcp_tok_abc123' },
-    };
-    renderAuthedPage(<ProfilePage {...props} />, { props });
-
-    expect(screen.getByText('Your token — copy it now, it will not be shown again:')).toBeInTheDocument();
-    // The token renders on its own in a Code block…
-    expect(screen.getByText('mcp_tok_abc123')).toBeInTheDocument();
-    // …and is embedded in the copyable `claude mcp add` command with the server URL.
-    const command = screen.getByText(/claude mcp add aixle --transport http/);
-    expect(command).toHaveTextContent('http://localhost:4000/mcp');
-    expect(command).toHaveTextContent('Authorization: Bearer mcp_tok_abc123');
-    // With MCP already enabled the primary button rotates the token rather than enabling.
-    expect(screen.getByRole('button', { name: 'Regenerate token' })).toBeInTheDocument();
-  });
-
   it('patches the default agent runtime when a different credential is selected', async () => {
     const claude = buildCredential({ id: 100, agentType: 'claude_code' });
     const cursor = buildCredential({ id: 200, agentType: 'cursor_cli' });
@@ -534,6 +458,38 @@ describe('Profile/Show', () => {
     expect(router.put).toHaveBeenCalledWith(
       '/profile/update_default_model',
       { agentCredentialId: 100, defaultModel: 'claude-sonnet-4-5' },
+      expect.objectContaining({ preserveScroll: true, preserveState: true }),
+    );
+  });
+
+  it('keeps a saved default model visible when the fetched list does not contain it', async () => {
+    // A pin chosen before the model left the catalogue (or a Bedrock ARN) is not in
+    // agentModels. Mantine shows a value with no matching option as an empty input, so
+    // the row would read as "no default set" and hide the pin the session actually uses.
+    const credential = buildCredential({ id: 100, agentType: 'claude_code', defaultModel: 'claude-opus-4-1' });
+    const profile = buildProfile({ configuredAgents: ['claude_code'], agentCredentials: [credential] });
+    const props = {
+      ...baseProps(profile),
+      agentModels: [
+        {
+          agentType: 'claude_code',
+          models: [{ modelId: 'claude-opus-5', displayName: 'Claude Opus 5', description: 'Most capable' }],
+        },
+      ],
+    };
+    renderAuthedPage(<ProfilePage {...props} />, { props });
+
+    const modelsSection = screen.getByText('Default Models').parentElement as HTMLElement;
+    const select = within(modelsSection).getByRole('combobox');
+    expect(select).toHaveValue('claude-opus-4-1');
+
+    // ...and the current catalogue is still selectable from the same row.
+    await userEvent.click(select);
+    await userEvent.click(await screen.findByRole('option', { name: 'Claude Opus 5' }));
+
+    expect(router.put).toHaveBeenCalledWith(
+      '/profile/update_default_model',
+      { agentCredentialId: 100, defaultModel: 'claude-opus-5' },
       expect.objectContaining({ preserveScroll: true, preserveState: true }),
     );
   });

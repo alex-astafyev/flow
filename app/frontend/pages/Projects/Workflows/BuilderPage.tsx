@@ -5,7 +5,9 @@ import { IconArrowLeft, IconInfoCircle, IconPlayerPlay } from '@tabler/icons-rea
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDebouncedCallback } from 'use-debounce';
 
-import { RunWorkflowModal } from 'shared/components/RunWorkflowModal';
+import type { ConfigItemPicker } from '@/types/generated';
+
+import { RunWorkflowDrawer } from 'shared/components/RunWorkflowDrawer';
 import { apiFetch } from 'shared/lib/apiFetch';
 import {
   apiV1ProjectWorkflowPath,
@@ -73,6 +75,7 @@ interface Step {
   mcpServerIds: number[];
   skillIds: number[];
   assetIds: number[];
+  configItemIds: number[];
   inputAssetSpecs: AssetSpec[];
   outputAssetSpecs: AssetSpec[];
   subSteps: SubStep[];
@@ -89,6 +92,7 @@ interface Workflow {
   baseMCPServerIds: number[];
   baseAssetIds: number[];
   baseRepositoryIds: number[];
+  baseConfigItemIds: number[];
 }
 interface AgentModel {
   modelId: string;
@@ -110,6 +114,7 @@ interface Props {
   mcpServers?: NamedItem[];
   assets?: NamedItem[];
   repositories?: NamedItem[];
+  configItems?: ConfigItemPicker[];
   agentModels?: AgentModelsEntry[];
   readOnly: boolean;
   configuredAgents: string[];
@@ -124,6 +129,7 @@ const CONFIG_FIELDS = new Set([
   'baseMCPServerIds',
   'baseAssetIds',
   'baseRepositoryIds',
+  'baseConfigItemIds',
 ]);
 
 const requireProjectId = (projectId: number | null): number => {
@@ -157,6 +163,7 @@ const BuilderPage = () => {
     mcpServers: rawMcpServers,
     assets: rawAssets,
     repositories: rawRepositories,
+    configItems: rawConfigItems,
     agentModels: rawAgentModels,
     readOnly,
     configuredAgents,
@@ -171,6 +178,7 @@ const BuilderPage = () => {
   const mcpServers = rawMcpServers ?? [];
   const assets = rawAssets ?? [];
   const repositories = rawRepositories ?? [];
+  const configItems = rawConfigItems ?? [];
   const agentModels = rawAgentModels ?? [];
 
   const projectId = project?.id ?? null;
@@ -660,6 +668,8 @@ const BuilderPage = () => {
                       mcpServers={mcpServers}
                       assets={assets}
                       repositories={repositories}
+                      configItems={configItems}
+                      agentModels={agentModels}
                       readOnly={readOnly}
                       onFieldChange={(field, value, immediate) =>
                         updateStepField(selectedSession.id, field, value, immediate)
@@ -714,6 +724,7 @@ const BuilderPage = () => {
               mcpServers={mcpServers}
               assets={assets}
               repositories={repositories}
+              configItems={configItems}
               readOnly={readOnly}
               onWorkflowChange={updateWorkflowField}
             />
@@ -743,18 +754,23 @@ const BuilderPage = () => {
       </Modal>
 
       {project && (
-        <RunWorkflowModal
+        <RunWorkflowDrawer
           opened={runModalOpen}
           onClose={() => setRunModalOpen(false)}
-          workflowId={workflow.id}
-          workflowName={workflow.name}
-          steps={steps.map((s) => ({
-            id: s.id,
-            name: s.name,
-            position: s.position,
-            allowNonInteractive: s.allowNonInteractive,
-            dependsOnStepIds: s.dependsOnStepIds,
-          }))}
+          workflows={[
+            {
+              id: workflow.id,
+              name: workflow.name,
+              steps: steps.map((s) => ({
+                id: s.id,
+                name: s.name,
+                position: s.position,
+                allowNonInteractive: s.allowNonInteractive,
+                dependsOnStepIds: s.dependsOnStepIds,
+              })),
+            },
+          ]}
+          initialWorkflowId={workflow.id}
           projectId={project.id}
           configuredAgents={configuredAgents}
           defaultAgentRuntime={defaultAgentRuntime}

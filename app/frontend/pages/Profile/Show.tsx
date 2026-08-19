@@ -1,21 +1,19 @@
-import { Head, router, useForm } from '@inertiajs/react';
+import { Deferred, Head, router, useForm } from '@inertiajs/react';
 import {
-  CopyButton,
   Alert,
   Badge,
   Box,
   Button,
   Card,
-  Code,
   Center,
   Divider,
   Group,
   Loader,
   Modal,
   Select,
+  Skeleton,
   Stack,
   Switch,
-  Tabs,
   Text,
   TextInput,
   ThemeIcon,
@@ -26,7 +24,7 @@ import { useDisclosure } from '@mantine/hooks';
 import { modals } from '@mantine/modals';
 import { notifications } from '@mantine/notifications';
 import { type Subscription } from '@rails/actioncable';
-import { IconCheck, IconCopy, IconDoorExit, IconLock, IconTrash } from '@tabler/icons-react';
+import { IconCheck, IconDoorExit, IconLock, IconTrash } from '@tabler/icons-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { z } from 'zod';
 
@@ -41,17 +39,16 @@ import {
   apiV1TerminalSessionPath,
   apiV1TerminalSessionsPath,
   companyMembershipPath,
-  disableMCPTokenProfilePath,
   finishApiV1TerminalSessionPath,
   healthApiV1CloudAwsConnectionPath,
-  regenerateMCPTokenProfilePath,
-  usageProfilePath,
 } from 'shared/routes';
 import { AGENT_BRAND_COLORS, TERMINAL_BG } from 'shared/theme/vendorColors';
 import { type AgentCredential, type AgentType, type SharedMembership, type SharedUser, type UserRole } from 'shared/ui';
 import { StatusBadge, type StatusTone } from 'shared/ui/StatusBadge';
 
+import { ProfileTabs } from './ProfileTabs';
 import classes from './Show.module.css';
+import { UsageLimitsCard, type UsageLimitsEntry } from './UsageLimitsCard';
 
 const LANGUAGE_OPTIONS = [
   { value: 'en', label: 'English' },
@@ -91,6 +88,12 @@ const AVAILABLE_AGENTS: { type: AgentType; name: string; description: string; co
     name: 'Gemini CLI',
     description: "Google's multimodal AI for code and documentation tasks",
     color: AGENT_BRAND_COLORS.gemini_cli,
+  },
+  {
+    type: 'grok',
+    name: 'Grok',
+    description: "xAI's Grok CLI for agentic coding in the terminal",
+    color: AGENT_BRAND_COLORS.grok,
   },
 ];
 
@@ -153,13 +156,6 @@ interface AgentModelsEntry {
   models: AgentModel[];
 }
 
-interface McpProps {
-  enabled: boolean;
-  lastUsedAt: string | null;
-  serverUrl: string;
-  token: string | null;
-}
-
 interface Props {
   profile: SharedUser;
   // Memberships still in the `invited` state — profile.memberships is active-only.
@@ -168,7 +164,8 @@ interface Props {
   languageOptions: string[];
   agentModels: AgentModelsEntry[];
   cableStream?: string;
-  mcp: McpProps;
+  // Deferred (group "limits"): absent until Inertia's follow-up request lands.
+  usageLimits?: UsageLimitsEntry[];
 }
 
 function DefaultAgentSelector({ profile }: { profile: SharedUser }) {
@@ -251,12 +248,18 @@ function CredentialModelRow({ credential, models }: { credential: AgentCredentia
     handleSubmit(val);
   };
 
-  const selectData =
-    models.length > 0
-      ? models.map((m) => ({ value: m.modelId, label: m.displayName }))
-      : currentModel
-        ? [{ value: currentModel, label: currentModel }]
-        : [];
+  // The saved pin is always an option, even when the fetched list doesn't contain it
+  // (a model retired since it was chosen, a Bedrock inference-profile ARN, or a list
+  // that failed to load). Mantine renders a value with no matching option as an empty
+  // input, so without this the row reads as "no default set" and the next change the
+  // user makes silently replaces a pin they never saw.
+  const selectData = useMemo(() => {
+    const options = models.map((m) => ({ value: m.modelId, label: m.displayName }));
+    if (currentModel && !options.some((o) => o.value === currentModel)) {
+      options.push({ value: currentModel, label: currentModel });
+    }
+    return options;
+  }, [models, currentModel]);
 
   return (
     <Box>
@@ -1025,102 +1028,7 @@ function AgentRuntimesSection({ profile }: { profile: SharedUser }) {
   );
 }
 
-function PersonalMcpSection({ mcp }: { mcp: McpProps }) {
-  const claudeCommand = mcp.token
-    ? `claude mcp add aixle --transport http ${mcp.serverUrl} --header "Authorization: Bearer ${mcp.token}"`
-    : null;
-
-  return (
-    <Card p={24}>
-      <Title order={4} mb={4}>
-        Personal MCP
-      </Title>
-      <Text fz={14} c="dimmed" mb="md">
-        Connect your AI agent (Claude Code, Cursor, ...) to Aixle: list your projects, manage board tasks and build
-        workflows — with exactly your access level.
-      </Text>
-
-      <Group gap={8} mb="md">
-        <StatusBadge tone={mcp.enabled ? 'success' : 'neutral'}>{mcp.enabled ? 'Enabled' : 'Disabled'}</StatusBadge>
-        {mcp.enabled && <StatusBadge tone="neutral">{mcp.lastUsedAt ? 'In use' : 'Not used yet'}</StatusBadge>}
-      </Group>
-
-      {mcp.token && (
-        <Box mb="md">
-          <Group justify="space-between" align="center" wrap="nowrap" gap="sm">
-            <Text fz={14} fw={600} c="var(--app-text-primary)">
-              Your token — copy it now, it will not be shown again:
-            </Text>
-            {/* This is the only moment the token exists in the UI, so it needs a
-                copy affordance, not a select-the-text-yourself code block. */}
-            <CopyButton value={mcp.token}>
-              {({ copied, copy }) => (
-                <Button
-                  variant={copied ? 'light' : 'filled'}
-                  size="compact-sm"
-                  onClick={copy}
-                  leftSection={copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-                >
-                  {copied ? 'Copied' : 'Copy token'}
-                </Button>
-              )}
-            </CopyButton>
-          </Group>
-          <Code block my={8} data-testid="mcp-token">
-            {mcp.token}
-          </Code>
-          <Group justify="space-between" align="center" wrap="nowrap" gap="sm">
-            <Text fz={13} c="dimmed" mb={4}>
-              Add to Claude Code:
-            </Text>
-            <CopyButton value={claudeCommand ?? ''}>
-              {({ copied, copy }) => (
-                <Button
-                  variant="subtle"
-                  size="compact-xs"
-                  onClick={copy}
-                  leftSection={copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
-                >
-                  {copied ? 'Copied' : 'Copy command'}
-                </Button>
-              )}
-            </CopyButton>
-          </Group>
-          <Code block data-testid="mcp-claude-command">
-            {claudeCommand}
-          </Code>
-        </Box>
-      )}
-
-      {mcp.enabled && !mcp.token && (
-        <Text fz={13} c="dimmed" mb="md">
-          MCP access is enabled.
-          {mcp.lastUsedAt ? ` Last used ${new Date(mcp.lastUsedAt).toLocaleString()}.` : ' Not used yet.'}
-        </Text>
-      )}
-
-      <Group gap="sm">
-        <Button
-          variant={mcp.enabled ? 'default' : 'filled'}
-          onClick={() => router.post(regenerateMCPTokenProfilePath(), {}, { preserveScroll: true })}
-        >
-          {mcp.enabled ? 'Regenerate token' : 'Enable MCP'}
-        </Button>
-        {mcp.enabled && (
-          <Button
-            variant="subtle"
-            color="red"
-            onClick={() => router.delete(disableMCPTokenProfilePath(), { preserveScroll: true })}
-          >
-            Disable
-          </Button>
-        )}
-      </Group>
-    </Card>
-  );
-}
-
-function ProfilePage({ profile, pendingInvitations, agentModels, cableStream, mcp }: Props) {
+function ProfilePage({ profile, pendingInvitations, agentModels, cableStream, usageLimits }: Props) {
   const currentCompanyName = profile.currentCompany?.name ?? null;
   useInertiaCableStream(cableStream, { only: ['profile', 'agent_models'] });
 
@@ -1181,21 +1089,10 @@ function ProfilePage({ profile, pendingInvitations, agentModels, cableStream, mc
           </Text>
         )}
 
-        <Tabs
-          value="account"
-          onChange={(v) => {
-            if (v === 'usage') router.visit(usageProfilePath());
-          }}
-          mb="lg"
-        >
-          <Tabs.List>
-            <Tabs.Tab value="account">Account</Tabs.Tab>
-            <Tabs.Tab value="usage">Usage</Tabs.Tab>
-          </Tabs.List>
-        </Tabs>
+        <ProfileTabs active="account" />
 
         <Box className={classes.grid2}>
-          {/* Main column: personal information, agent runtimes, personal MCP. */}
+          {/* Main column: personal information, agent runtimes. */}
           <Box className={classes.colMain}>
             <Card p={24}>
               <Title order={4} mb={4}>
@@ -1289,7 +1186,10 @@ function ProfilePage({ profile, pendingInvitations, agentModels, cableStream, mc
             </Card>
 
             <AgentRuntimesSection profile={profile} />
-            <PersonalMcpSection mcp={mcp} />
+            {/* Deferred: reads the vendor's usage endpoint, so it must not hold up the page. */}
+            <Deferred data="usageLimits" fallback={<Skeleton height={180} radius="sm" />}>
+              <UsageLimitsCard entries={usageLimits ?? []} />
+            </Deferred>
           </Box>
 
           {/* Side column: companies, agent defaults. */}

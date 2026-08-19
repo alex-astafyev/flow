@@ -11,8 +11,9 @@ class BoardActivity < ApplicationRecord
     task_created task_updated task_deleted task_moved
     task_archived task_unarchived
     comment_added asset_attached
-    workflow_started workflow_completed workflow_failed
+    workflow_started workflow_completed workflow_failed workflow_cancelled
     human_help_requested
+    gate_reconciled gate_stale
   ]
   enumerize :actor_type, in: %i[human agent system]
 

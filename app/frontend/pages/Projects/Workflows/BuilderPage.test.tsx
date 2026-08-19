@@ -26,6 +26,7 @@ const makeStep = (overrides: Record<string, unknown> = {}) => ({
   skillIds: [] as number[],
   assetIds: [] as number[],
   repositoryIds: [] as number[],
+  configItemIds: [] as number[],
   inputAssetSpecs: [] as { name: string; assetType: string; required: boolean; namePattern?: string | null }[],
   outputAssetSpecs: [] as { name: string; assetType: string; required: boolean; namePattern?: string | null }[],
   subSteps: [] as {
@@ -50,6 +51,7 @@ const makeWorkflow = (overrides: Record<string, unknown> = {}) => ({
   baseMCPServerIds: [] as number[],
   baseAssetIds: [] as number[],
   baseRepositoryIds: [] as number[],
+  baseConfigItemIds: [] as number[],
   ...overrides,
 });
 
@@ -64,6 +66,7 @@ const projectProps = (overrides: Record<string, unknown> = {}) => ({
   mcpServers: [],
   assets: [],
   repositories: [],
+  configItems: [],
   agentModels: [],
   readOnly: false,
   configuredAgents: [] as string[],
@@ -250,6 +253,31 @@ describe('Projects/Workflows/BuilderPage', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('attaching a config item to a step PATCHes configItemIds', async () => {
+    const user = userEvent.setup();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({}),
+    } as Response);
+
+    renderAuthedPage(<BuilderPage />, {
+      props: projectProps({
+        steps: [makeStep({ id: 1, name: 'Draft spec', position: 1 })],
+        configItems: [
+          { id: 11, name: 'STRIPE_KEY', itemType: 'secret' },
+          { id: 12, name: 'API_BASE', itemType: 'variable' },
+        ],
+      }),
+    });
+
+    await user.click(screen.getByRole('combobox', { name: /secrets and variables/i }));
+    await user.click(await screen.findByText('STRIPE_KEY (secret)'));
+
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const patch = fetchSpy.mock.calls.find(([, init]) => init?.method === 'PATCH');
+    expect(JSON.parse(patch![1]!.body as string).step.configItemIds).toEqual([11]);
+  });
+
   it('renders drag handles for sessions in the tree nav', () => {
     renderAuthedPage(<BuilderPage />, { props: projectProps() });
 
@@ -266,7 +294,7 @@ describe('Projects/Workflows/BuilderPage', () => {
     expect(screen.getByText('Implement')).toBeInTheDocument();
   });
 
-  it('opening the Run modal shows the run dialog titled for the workflow', async () => {
+  it('opening the Run drawer shows it titled for the workflow', async () => {
     renderAuthedPage(<BuilderPage />, {
       props: projectProps({
         steps: [makeStep({ id: 1, name: 'Draft spec', position: 1, instructions: 'Do the thing' })],
@@ -275,12 +303,9 @@ describe('Projects/Workflows/BuilderPage', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Run' }));
 
-    // The Run modal title is split between "Run: " and workflowName across elements.
-    // Use the dialog container accessible name or look for the individual parts.
-    const modal = await screen.findByRole('dialog');
-    expect(modal).toBeInTheDocument();
-    expect(modal.textContent).toMatch(/Run:.*Release pipeline/);
-    expect(screen.getByText('Execution Mode')).toBeInTheDocument();
+    const drawer = await screen.findByRole('dialog');
+    expect(drawer.textContent).toMatch(/Run:.*Release pipeline/);
+    expect(screen.getByText('Execution mode')).toBeInTheDocument();
   });
 
   it('disables the Run button when no session has instructions', () => {
@@ -753,6 +778,33 @@ describe('Projects/Workflows/BuilderPage', () => {
     expect(screen.getAllByText('Claude Code').length).toBeGreaterThan(0);
 
     await waitFor(() => expect(fetchSpy).not.toHaveBeenCalled());
+  });
+
+  it("choosing a Preferred Model PATCHes preferredModel, scoped to the runtime's models", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    renderAuthedPage(<BuilderPage />, {
+      props: projectProps({
+        steps: [makeStep({ id: 1, name: 'Draft spec', position: 1, requiredAgentRuntime: 'claude_code' })],
+        agentModels: [{ agentType: 'claude_code', models: [{ modelId: 'opus-9', displayName: 'Opus 9' }] }],
+      }),
+    });
+
+    const preferredModelCombobox = screen.getAllByLabelText('Preferred model')[0];
+    await userEvent.click(preferredModelCombobox);
+    await userEvent.click(await screen.findByRole('option', { name: 'Opus 9' }));
+
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        '/api/v1/projects/7/workflows/3/steps/1',
+        expect.objectContaining({ method: 'PATCH' }),
+      ),
+    );
+    const call = fetchSpy.mock.calls.find(([url]) => url === '/api/v1/projects/7/workflows/3/steps/1');
+    const body = JSON.parse((call![1] as RequestInit).body as string);
+    expect(body.step.preferredModel).toBe('opus-9');
   });
 
   it('selecting a dependency PATCHes dependsOnStepIds and shows the "↳ AFTER" badge in the sidebar', async () => {

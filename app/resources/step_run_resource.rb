@@ -35,10 +35,36 @@ class StepRunResource < ApplicationResource
     sr.terminal_session&.state
   end
 
+  # The session card inside a run reports the same four numbers the list row
+  # does, so a run reads as the sum of its sessions rather than as a black box.
+  typelize :string?
+  attribute :agent_type do |sr|
+    sr.terminal_session&.agent_type
+  end
+
+  typelize :number
+  attribute :total_tokens do |sr|
+    sr.terminal_session&.total_tokens.to_i
+  end
+
+  typelize :number
+  attribute :cost_cents do |sr|
+    sr.terminal_session&.cost_cents.to_i
+  end
+
+  typelize :string?
+  attribute :initial_prompt do |sr|
+    sr.terminal_session&.initial_prompt
+  end
+
   typelize :string?
   attribute :terminal_url do |sr|
     ts = sr.terminal_session
-    next nil unless ts&.route_token.present? && ts.active?
+    # Gated on `ready?`, not the looser `active?` — the container only registers
+    # its traefik route inside `exec`, which is what flips the session to
+    # "ready". Handing out the URL any earlier (e.g. "not_started"/"running")
+    # points the iframe at a route that doesn't exist yet and it 404s.
+    next nil unless ts&.route_token.present? && ts.ready?
 
     ws_base = params.dig(:traefik, :ws_base)
     "#{ws_base}/t/#{ts.route_token}/tty/ws"
@@ -49,7 +75,7 @@ class StepRunResource < ApplicationResource
   typelize :string?
   attribute :ide_url do |sr|
     ts = sr.terminal_session
-    next nil unless ts&.route_token.present? && ts.active?
+    next nil unless ts&.route_token.present? && ts.ready?
     next nil if ts.mode == "non_interactive"
 
     http_base = params.dig(:traefik, :http_base)

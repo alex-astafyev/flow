@@ -102,31 +102,89 @@ describe('AppSidebar', () => {
     // Project nav items appear and link under the project id.
     expect(screen.getByRole('link', { name: 'Overview' })).toHaveAttribute('href', '/company/projects/7/overview');
     expect(screen.getByRole('link', { name: 'Tasks' })).toHaveAttribute('href', '/company/projects/7/board');
-    expect(screen.getByRole('link', { name: 'Sessions' })).toBeInTheDocument();
+    // Sessions and runs are one entry, pointing at the unified list.
+    expect(screen.getByRole('link', { name: 'Sessions & Runs' })).toHaveAttribute(
+      'href',
+      '/company/projects/7/sessions',
+    );
+    expect(screen.queryByRole('link', { name: 'Runs' })).not.toBeInTheDocument();
 
     // The switcher reflects the current project's name as the workspace title.
     expect(screen.getByText('Aurora Platform')).toBeInTheDocument();
   });
 
-  it('opens the workspace switcher and navigates to a selected project via router.visit', async () => {
+  // The switcher's project rows are real Inertia <Link>s; left alone, a click would trigger
+  // the real Router.visit (which has no live page context under jsdom and throws). A
+  // capture-phase preventDefault makes Inertia's shouldIntercept() bail out before visiting,
+  // while React's synthetic onClick still fires.
+  function suppressHardNavigation() {
+    const handler = (e: Event) => e.preventDefault();
+    document.addEventListener('click', handler, true);
+    return () => document.removeEventListener('click', handler, true);
+  }
+
+  async function openSwitcher(user: ReturnType<typeof userEvent.setup>) {
+    // The switcher button shows "All Projects" while no project is current.
+    await user.click(screen.getByRole('button', { name: /All Projects/ }));
+    return screen.findByRole('link', { name: /Borealis Pipeline/ });
+  }
+
+  // Rendering each project as a link is what buys the browser-native affordances the
+  // switcher needs: Cmd/Ctrl+click into a new tab and a right-click "Open in new
+  // tab/window" context menu. Both are the browser's job once there is an href.
+  it('opens the workspace switcher and lists each project as a link to that project', async () => {
     const user = userEvent.setup();
     renderAuthedPage(<AppSidebar context="company" projects={projects} />);
 
-    // The switcher button shows "All Projects" while no project is current.
-    await user.click(screen.getByRole('button', { name: /All Projects/ }));
+    const borealis = await openSwitcher(user);
 
-    // Popover lists the available projects; click one to switch.
-    const borealis = await screen.findByText('Borealis Pipeline');
+    expect(borealis).toHaveAttribute('href', '/company/projects/8');
+    expect(screen.getByRole('link', { name: /Aurora Platform/ })).toHaveAttribute('href', '/company/projects/7');
+  });
+
+  it('marks the current project link as the active page in the switcher', async () => {
+    const user = userEvent.setup();
+    renderAuthedPage(<AppSidebar projectId="7" context="project" projects={projects} currentProjectId="7" />);
+
+    await user.click(screen.getByRole('button', { name: /Aurora Platform/ }));
+
+    expect(await screen.findByRole('link', { name: /Aurora Platform/ })).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('link', { name: /Borealis Pipeline/ })).not.toHaveAttribute('aria-current');
+  });
+
+  it('closes the switcher on a plain click, which navigates in the same tab', async () => {
+    const restore = suppressHardNavigation();
+    const user = userEvent.setup();
+    renderAuthedPage(<AppSidebar context="company" projects={projects} />);
+
+    const borealis = await openSwitcher(user);
     await user.click(borealis);
 
-    expect(router.visit).toHaveBeenCalledWith('/company/projects/8');
+    expect(screen.queryByRole('link', { name: /Borealis Pipeline/ })).not.toBeInTheDocument();
+    restore();
+  });
+
+  // A modifier-click opens the project in another tab and leaves this one where it was, so
+  // dismissing the popover would hide a switcher that never switched.
+  it('keeps the switcher open on a modifier-click, letting the browser open a new tab', async () => {
+    const restore = suppressHardNavigation();
+    const user = userEvent.setup();
+    renderAuthedPage(<AppSidebar context="company" projects={projects} />);
+
+    const borealis = await openSwitcher(user);
+    await user.keyboard('{Meta>}');
+    await user.click(borealis);
+    await user.keyboard('{/Meta}');
+
+    expect(screen.getByRole('link', { name: /Borealis Pipeline/ })).toBeInTheDocument();
+    restore();
   });
 
   it('sends "Build with AI" to the current project\'s builder in project context', async () => {
     const user = userEvent.setup();
     renderAuthedPage(<AppSidebar projectId="7" context="project" projects={projects} currentProjectId="7" />);
 
-    expect(screen.getByText('AI Builder')).toBeInTheDocument();
+    expect(screen.getByText('Tasks, boards, and workflows — from one prompt.')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /Build with AI/ }));
 
     expect(router.visit).toHaveBeenCalledWith('/company/projects/7/aixle_builder');
@@ -179,6 +237,47 @@ describe('AppSidebar', () => {
 
     // After collapsing, the button flips to the expand affordance.
     expect(screen.getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument();
+  });
+
+  it('collapses and re-expands a nav group, hiding and showing its items', async () => {
+    const user = userEvent.setup();
+    renderAuthedPage(<AppSidebar projectId="7" context="project" projects={projects} currentProjectId="7" />);
+
+    // All groups are expanded by default.
+    expect(screen.getByRole('link', { name: 'Tasks' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Work' }));
+    expect(screen.queryByRole('link', { name: 'Tasks' })).not.toBeInTheDocument();
+    // Other groups are unaffected.
+    expect(screen.getByRole('link', { name: 'Agents' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Work' }));
+    expect(screen.getByRole('link', { name: 'Tasks' })).toBeInTheDocument();
+  });
+
+  it('persists a collapsed nav group across remounts', async () => {
+    const user = userEvent.setup();
+    const { unmount } = renderAuthedPage(
+      <AppSidebar projectId="7" context="project" projects={projects} currentProjectId="7" />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Work' }));
+    expect(screen.queryByRole('link', { name: 'Tasks' })).not.toBeInTheDocument();
+    unmount();
+
+    renderAuthedPage(<AppSidebar projectId="7" context="project" projects={projects} currentProjectId="7" />);
+    expect(screen.queryByRole('link', { name: 'Tasks' })).not.toBeInTheDocument();
+  });
+
+  it('shows every item in the icon rail even when its group is collapsed', async () => {
+    const user = userEvent.setup();
+    renderAuthedPage(<AppSidebar projectId="7" context="project" projects={projects} currentProjectId="7" />);
+
+    await user.click(screen.getByRole('button', { name: 'Work' }));
+    expect(screen.queryByRole('link', { name: 'Tasks' })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Collapse sidebar' }));
+    expect(screen.getByRole('link', { name: 'Tasks' })).toBeInTheDocument();
   });
 
   // The company switcher is a Slack-style rail left of the sidebar. A

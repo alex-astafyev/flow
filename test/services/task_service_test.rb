@@ -133,6 +133,65 @@ class TaskServiceTest < ActiveSupport::TestCase
     assert_not BoardActivity.exists?(board: @board, event_type: :task_updated, board_task: task)
   end
 
+  # A column change arriving as an attribute is still a move: the board's whole
+  # transition pipeline (history, activity, auto-trigger) hangs off #move, and
+  # board_column_id is a permitted attribute on the task endpoint.
+  test "update that changes the column records a transition and a task_moved activity" do
+    other = create(:board_column, board: @board, name: "Done")
+    task = create(:board_task, board: @board, board_column: @column)
+
+    assert_difference -> { ColumnTransition.count }, 1 do
+      TaskService.update(task: task, params: { board_column_id: other.id }, actor: @user)
+    end
+
+    assert_equal other.id, task.reload.board_column_id
+    assert BoardActivity.exists?(board: @board, event_type: :task_moved, board_task: task)
+  end
+
+  test "update that changes the column fires that column's auto-trigger" do
+    other = create(:board_column, board: @board, name: "Done")
+    workflow = create(:workflow, scope: @project)
+    ColumnWorkflowBinding.create!(board_column: other, workflow: workflow, trigger_mode: :auto)
+    task = create(:board_task, board: @board, board_column: @column)
+    WorkflowService.expects(:start).once.returns(create(:workflow_run, workflow: workflow, project: @project, user: @user))
+
+    TaskService.update(task: task, params: { board_column_id: other.id }, actor: @user)
+  end
+
+  test "update that renames and moves in one request logs the rename and the move separately" do
+    other = create(:board_column, board: @board, name: "Done")
+    task = create(:board_task, board: @board, board_column: @column, title: "Old")
+
+    TaskService.update(task: task, params: { title: "New", board_column_id: other.id }, actor: @user)
+
+    assert_equal "New", task.reload.title
+    assert_equal other.id, task.board_column_id
+    assert BoardActivity.exists?(board: @board, event_type: :task_updated, board_task: task)
+    assert BoardActivity.exists?(board: @board, event_type: :task_moved, board_task: task)
+  end
+
+  # Re-submitting the form the card is already in must not manufacture a
+  # transition — a move is a change of column, not a restatement of one.
+  test "update to the column the task is already in records no transition" do
+    task = create(:board_task, board: @board, board_column: @column)
+
+    assert_no_difference -> { ColumnTransition.count } do
+      TaskService.update(task: task, params: { board_column_id: @column.id }, actor: @user)
+    end
+  end
+
+  # The column is resolved on the task's own board, so a foreign id still has to
+  # fail validation rather than be quietly dropped on the way to #move.
+  test "update to a column on another board is rejected" do
+    foreign_column = create(:board_column, board: create(:board, project: create(:project, owner: @user, company: @company)))
+    task = create(:board_task, board: @board, board_column: @column)
+
+    result = TaskService.update(task: task, params: { board_column_id: foreign_column.id }, actor: @user)
+
+    assert result.errors[:board_column].present?
+    assert_equal @column.id, task.reload.board_column_id
+  end
+
   # == destroy ==
 
   test "destroy removes task and records activity" do
@@ -378,6 +437,202 @@ class TaskServiceTest < ActiveSupport::TestCase
     TaskService.resolve_gate(gate: gate1, resolution_data: { conclusion: "success" })
   end
 
+  # == mark_gate_stale ==
+
+  test "mark_gate_stale ends the wait with a reason but never with a passing verdict" do
+    task = create(:board_task, board: @board, board_column: @column)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    TaskService.mark_gate_stale(gate: gate, reason: "PR #1 cannot be read", detail: "404 Not Found")
+
+    gate.reload
+    assert gate.stale?
+    assert_equal "stale", gate.ci_status
+    assert_equal "PR #1 cannot be read", gate.diagnostic_reason
+    assert_equal "stale", gate.resolution_data["outcome"]
+    assert_equal "404 Not Found", gate.resolution_data["detail"]
+    assert_nil gate.conclusion
+    assert_nil gate.resolved_at
+    assert_not gate.passed?
+  end
+
+  test "mark_gate_stale records the escalation on the board activity feed" do
+    task = create(:board_task, board: @board, board_column: @column)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    TaskService.mark_gate_stale(gate: gate, reason: "no CI result after 13 hours")
+
+    activity = BoardActivity.where(event_type: "gate_stale", board_task: task).last
+    assert_not_nil activity
+    assert_equal "system", activity.actor_type
+    assert_equal gate.id, activity.metadata["gate_id"]
+  end
+
+  test "mark_gate_stale releases the auto-trigger the gate was holding" do
+    workflow = create(:workflow, scope: @project)
+    ColumnWorkflowBinding.create!(board_column: @column, workflow: workflow, trigger_mode: :auto, cooldown_seconds: 0)
+
+    task = create(:board_task, board: @board, board_column: @column, assignee: @user)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    WorkflowService.expects(:start).with(
+      has_entries(workflow: workflow, task: task, mode: :non_interactive)
+    ).once
+
+    TaskService.mark_gate_stale(gate: gate, reason: "run deleted")
+  end
+
+  test "mark_gate_stale leaves the auto-trigger held while another gate is pending" do
+    workflow = create(:workflow, scope: @project)
+    ColumnWorkflowBinding.create!(board_column: @column, workflow: workflow, trigger_mode: :auto, cooldown_seconds: 0)
+
+    task = create(:board_task, board: @board, board_column: @column, assignee: @user)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+    task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 2 },
+      creator: @user
+    )
+
+    WorkflowService.expects(:start).never
+
+    TaskService.mark_gate_stale(gate: gate, reason: "run deleted")
+  end
+
+  test "resolve_gate_by_reconciliation resolves the gate and records the activity" do
+    task = create(:board_task, board: @board, board_column: @column)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    TaskService.resolve_gate_by_reconciliation(
+      gate: gate,
+      resolution_data: { "conclusion" => "failure", "source" => "reconciliation" }
+    )
+
+    gate.reload
+    assert gate.resolved?
+    assert_equal "failure", gate.conclusion
+    assert_equal "failed", gate.ci_status
+    activity = BoardActivity.where(event_type: "gate_reconciled", board_task: task).last
+    assert_not_nil activity
+    assert_equal "failure", activity.metadata["conclusion"]
+  end
+
+  # == gate transitions are compare-and-set ==
+  #
+  # A CI gate has three racing writers: its webhook delivery, the reconciliation
+  # sweep, and a retried/overlapping second sweeper. Every terminal transition
+  # re-reads `pending` under a row lock, so the first writer wins outright and the
+  # losers are no-ops — no overwritten verdict, no duplicate activity row, no
+  # second auto-trigger dispatch.
+
+  test "resolve_gate is a no-op on an already resolved gate instead of overwriting its verdict" do
+    task = create(:board_task, board: @board, board_column: @column)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    assert TaskService.resolve_gate(gate: gate, resolution_data: { conclusion: "failure" })
+    resolved_at = gate.reload.resolved_at
+
+    assert_not TaskService.resolve_gate(gate: gate, resolution_data: { conclusion: "success" })
+
+    gate.reload
+    assert_equal "failure", gate.conclusion
+    assert_equal resolved_at.to_i, gate.resolved_at.to_i
+  end
+
+  test "resolve_gate dispatches the auto-trigger once when the same gate is resolved twice" do
+    workflow = create(:workflow, scope: @project)
+    ColumnWorkflowBinding.create!(board_column: @column, workflow: workflow, trigger_mode: :auto, cooldown_seconds: 0)
+
+    task = create(:board_task, board: @board, board_column: @column, assignee: @user)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    WorkflowService.expects(:start).with(
+      has_entries(workflow: workflow, task: task, mode: :non_interactive)
+    ).once
+
+    TaskService.resolve_gate(gate: gate, resolution_data: { conclusion: "success" })
+    TaskService.resolve_gate(gate: gate, resolution_data: { conclusion: "success" })
+  end
+
+  test "mark_gate_stale refuses to replace a provider verdict with 'we do not know'" do
+    task = create(:board_task, board: @board, board_column: @column)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+    TaskService.resolve_gate(gate: gate, resolution_data: { conclusion: "failure" })
+
+    assert_no_difference -> { BoardActivity.where(event_type: "gate_stale").count } do
+      assert_not TaskService.mark_gate_stale(gate: gate, reason: "no CI result after 13 hours")
+    end
+
+    gate.reload
+    assert gate.resolved?
+    assert_equal "failed", gate.ci_status
+    assert_equal "failure", gate.conclusion
+    assert_nil gate.diagnostic_reason
+  end
+
+  test "resolve_gate_by_reconciliation records no second activity when the webhook already won" do
+    task = create(:board_task, board: @board, board_column: @column)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+    TaskService.resolve_gate(gate: gate, resolution_data: { conclusion: "failure" })
+
+    assert_no_difference -> { BoardActivity.where(event_type: "gate_reconciled").count } do
+      assert_not TaskService.resolve_gate_by_reconciliation(
+        gate: gate,
+        resolution_data: { "conclusion" => "success", "source" => "reconciliation" }
+      )
+    end
+
+    assert_equal "failure", gate.reload.conclusion
+  end
+
+  test "mark_gate_stale treats a gate deleted from under it as a lost race, not an error" do
+    task = create(:board_task, board: @board, board_column: @column)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+    Gate.where(id: gate.id).delete_all
+
+    assert_not TaskService.mark_gate_stale(gate: gate, reason: "run deleted")
+  end
+
   test "remove_gate deletes pending gate" do
     task = create(:board_task, board: @board, board_column: @column)
     gate = task.gates.create!(
@@ -407,6 +662,56 @@ class TaskServiceTest < ActiveSupport::TestCase
     ).once
 
     TaskService.remove_gate(gate: gate, actor: @user)
+  end
+
+  # A stale gate stopped blocking the column when it went terminal, so the row
+  # left behind is an audit record. Deleting it releases nothing and must not
+  # record or dispatch a second column trigger.
+  test "remove_gate does not re-trigger the auto-workflow when it deletes a stale gate" do
+    workflow = create(:workflow, scope: @project)
+    ColumnWorkflowBinding.create!(board_column: @column, workflow: workflow, trigger_mode: :auto, cooldown_seconds: 0)
+
+    task = create(:board_task, board: @board, board_column: @column, assignee: @user)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      status: :stale,
+      diagnostic_reason: "run deleted",
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    WorkflowService.expects(:start).never
+
+    assert_difference -> { Gate.count }, -1 do
+      assert_no_difference -> { TriggerEvent.where(event_type: TriggerEngine::COLUMN_EVENT_TYPE).count } do
+        TaskService.remove_gate(gate: gate, actor: @user)
+      end
+    end
+  end
+
+  # The whole lifecycle of the gate the reconciliation sweep gave up on: it is
+  # staled (which releases the column) and later cleared by hand. The column
+  # workflow must start exactly once across both steps.
+  test "remove_gate after mark_gate_stale starts the column workflow exactly once" do
+    workflow = create(:workflow, scope: @project)
+    ColumnWorkflowBinding.create!(board_column: @column, workflow: workflow, trigger_mode: :auto, cooldown_seconds: 0)
+
+    task = create(:board_task, board: @board, board_column: @column, assignee: @user)
+    gate = task.gates.create!(
+      gate_type: :github_checks_completed,
+      metadata: { repo_full_name: "org/app", pr_number: 1 },
+      creator: @user
+    )
+
+    WorkflowService.expects(:start).with(
+      has_entries(workflow: workflow, task: task, mode: :non_interactive)
+    ).once
+
+    TaskService.mark_gate_stale(gate: gate, reason: "run deleted")
+
+    assert_no_difference -> { TriggerEvent.where(event_type: TriggerEngine::COLUMN_EVENT_TYPE).count } do
+      TaskService.remove_gate(gate: gate, actor: @user)
+    end
   end
 
   # == check_auto_trigger (pending gates guard) ==
@@ -440,7 +745,11 @@ class TaskServiceTest < ActiveSupport::TestCase
     TaskService.check_auto_trigger(task: task, column: @column, actor: @user)
   end
 
-  test "check_auto_trigger does not start workflow when last run failed with quota_exceeded" do
+  # Regression: a quota failure used to latch the column off permanently — the
+  # next move, and every move after it, silently did nothing until somebody
+  # started a successful run by hand. Vendor quotas reset on their own, so the
+  # board has to keep firing and let the run report the quota if it is still hit.
+  test "check_auto_trigger still starts the workflow after a run failed on quota" do
     workflow = create(:workflow, scope: @project)
     ColumnWorkflowBinding.create!(board_column: @column, workflow: workflow, trigger_mode: :auto, cooldown_seconds: 0)
     run = create(:workflow_run, :failed, workflow: workflow, project: @project, user: @user)
@@ -448,7 +757,9 @@ class TaskServiceTest < ActiveSupport::TestCase
 
     task = create(:board_task, board: @board, board_column: @column, assignee: @user)
 
-    WorkflowService.expects(:start).never
+    WorkflowService.expects(:start).with(
+      has_entries(workflow: workflow, task: task, mode: :non_interactive)
+    ).once
 
     TaskService.check_auto_trigger(task: task, column: @column, actor: @user)
   end

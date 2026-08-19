@@ -685,13 +685,93 @@ module Agents
 
     # Safety net used only when the live API is unreachable or the token lacks
     # model-list access. Kept current so even the fallback isn't badly stale.
+    #
+    # Deliberately the widely-available models only: this list is generic, while the
+    # live /v1/models answer is account-scoped. Claude Fable 5 and Mythos 5 are left
+    # out for that reason — Fable 5 requires 30-day data retention (an org on zero
+    # data retention gets a 400 on every request) and Mythos 5 needs Project
+    # Glasswing, so offering either to an account that cannot invoke it would hand
+    # the user a default that only fails at session start. Accounts that do have
+    # them still see them: they come back from the live fetch.
     FALLBACK_CLAUDE_MODELS = [
-      { model_id: "claude-opus-4-8", display_name: "Claude Opus 4.8", description: "Most capable model" },
-      { model_id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6", description: "Best balance of speed and intelligence" },
-      { model_id: "claude-opus-4-7", display_name: "Claude Opus 4.7", description: "Highly autonomous, long-horizon work" },
-      { model_id: "claude-opus-4-6", display_name: "Claude Opus 4.6", description: "Advanced reasoning" },
+      { model_id: "claude-opus-5", display_name: "Claude Opus 5", description: "Most capable model for agentic coding" },
+      { model_id: "claude-sonnet-5", display_name: "Claude Sonnet 5", description: "Best balance of speed and intelligence" },
+      { model_id: "claude-opus-4-8", display_name: "Claude Opus 4.8", description: "Previous-generation Opus" },
+      { model_id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6", description: "Previous-generation Sonnet" },
       { model_id: "claude-haiku-4-5", display_name: "Claude Haiku 4.5", description: "Fastest model" }
     ].freeze
+
+    # Retired Anthropic model ids (the API answers 404) mapped to their documented
+    # replacement, so a default pinned before the retirement still starts a session
+    # instead of failing on every run. Deprecated-but-live ids (claude-opus-4-0,
+    # claude-sonnet-4-0, claude-3-haiku-20240307, and the 4.5/4.6/4.7 aliases) are
+    # NOT listed: they still answer, and silently swapping a model a user can
+    # actually run is the opposite of preserving their choice.
+    RETIRED_MODEL_REPLACEMENTS = {
+      "claude-opus-4-1" => "claude-opus-5",
+      "claude-opus-4-1-20250805" => "claude-opus-5",
+      "claude-3-opus-20240229" => "claude-opus-4-8",
+      "claude-3-7-sonnet-20250219" => "claude-sonnet-5",
+      "claude-3-5-sonnet-20241022" => "claude-sonnet-5",
+      "claude-3-5-sonnet-20240620" => "claude-sonnet-5",
+      "claude-3-sonnet-20240229" => "claude-sonnet-5",
+      "claude-3-5-haiku-20241022" => "claude-haiku-4-5",
+      "claude-2.1" => "claude-sonnet-5",
+      "claude-2.0" => "claude-sonnet-5"
+    }.freeze
+
+    # =================================================================
+    # Subscription usage limits (claude.ai Pro/Max)
+    # =================================================================
+    #
+    # The numbers Claude Code's own `/usage` view shows: how much of the rolling
+    # 5-hour and 7-day quotas the account has burned, and when each resets. Only
+    # a claude.ai OAuth login has them — an API key bills per token and a Bedrock
+    # connection bills to AWS, so neither has a window to report.
+    USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+    # Windows the endpoint reports, in the order they are worth reading. The
+    # model-scoped weeklies are null for an account that hasn't touched that
+    # model in the current window, and are simply omitted then.
+    USAGE_WINDOW_KEYS = %w[five_hour seven_day seven_day_opus seven_day_sonnet].freeze
+
+    # Anthropic buckets this endpoint per client and answers 429 to anything that
+    # polls hard or arrives without a User-Agent. The CLI identifies itself and
+    # polls no faster than ~180s; we do the same (the poll floor lives in
+    # Agents::SubscriptionUsageService, which is the only caller).
+    USAGE_USER_AGENT = "claude-cli/#{CONFIG_VERSION} (external, aixle)"
+
+    # True when inference on this credential is billed against a claude.ai
+    # subscription — the only case where 5-hour / weekly windows exist.
+    def subscription_login?(credentials)
+      chosen_inference(credentials) == "claudeAiOauth"
+    end
+
+    # @param credentials [Hash] decrypted credential data
+    # @return [Hash, nil] nil when the credential has no subscription windows at
+    #   all; otherwise { status:, windows:, extra_usage: } with status one of
+    #   "ok" | "unauthorized" | "rate_limited" | "unavailable". A failure is a
+    #   status, not an exception: a usage panel is never worth breaking the
+    #   profile page over.
+    def fetch_subscription_usage(credentials)
+      return nil unless subscription_login?(credentials)
+
+      token = credentials.dig("claudeAiOauth", "accessToken")
+      return nil if token.blank?
+
+      response = request_subscription_usage(token)
+      case response
+      when Net::HTTPSuccess          then parse_subscription_usage(response.body)
+      when Net::HTTPUnauthorized, Net::HTTPForbidden then { status: "unauthorized" }
+      when Net::HTTPTooManyRequests  then { status: "rate_limited" }
+      else
+        Rails.logger.warn("[ClaudeCodeAdapter] usage endpoint returned #{response.code}: #{response.body.to_s.truncate(200)}")
+        { status: "unavailable" }
+      end
+    rescue StandardError => e
+      Rails.logger.warn("[ClaudeCodeAdapter] subscription usage fetch failed: #{e.class}: #{e.message}")
+      { status: "unavailable" }
+    end
 
     # Default environment variables for Claude Code runtime.
     def default_env_vars(session)
@@ -804,6 +884,46 @@ module Agents
     rescue StandardError => e
       Rails.logger.warn("[ClaudeCodeAdapter] Token refresh error: #{e.class}: #{e.message}")
       nil
+    end
+
+    def request_subscription_usage(token)
+      uri = URI(USAGE_URL)
+      req = Net::HTTP::Get.new(uri)
+      req["Authorization"] = "Bearer #{token}"
+      req["Accept"] = "application/json"
+      req["anthropic-beta"] = OAUTH_BETA_HEADER
+      req["User-Agent"] = USAGE_USER_AGENT
+      Net::HTTP.start(uri.hostname, uri.port, use_ssl: true, open_timeout: 5, read_timeout: 10) { |http| http.request(req) }
+    end
+
+    # A window the account has not touched in the current period comes back null;
+    # utilization 0 is a real answer and must survive (0 is not blank in Ruby, but
+    # spelling the nil check out keeps that from being a silent trap).
+    def parse_subscription_usage(body)
+      data = JSON.parse(body.to_s)
+      windows = USAGE_WINDOW_KEYS.filter_map do |key|
+        window = data[key]
+        next unless window.is_a?(Hash) && !window["utilization"].nil?
+
+        { key: key, utilization: window["utilization"].to_f, resets_at: window["resets_at"] }
+      end
+
+      { status: "ok", windows: windows, extra_usage: parse_extra_usage(data["extra_usage"]) }
+    end
+
+    # Pay-as-you-go spend on top of the plan, once the account has turned it on.
+    # Its fields stay null until something is actually consumed, so they are
+    # passed through as-is rather than defaulted to zero — "not started" and
+    # "nothing used" are different states to show.
+    def parse_extra_usage(raw)
+      return nil unless raw.is_a?(Hash) && raw["is_enabled"]
+
+      {
+        enabled: true,
+        utilization: raw["utilization"]&.to_f,
+        monthly_limit: raw["monthly_limit"]&.to_f,
+        used_credits: raw["used_credits"]&.to_f
+      }
     end
 
     # Keep whichever OAuth block has the later expiry; never drop one that only the

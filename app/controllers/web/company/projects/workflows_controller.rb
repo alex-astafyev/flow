@@ -2,14 +2,16 @@
 
 class Web::Company::Projects::WorkflowsController < Web::Company::Projects::ApplicationController
   def index
+    # `steps: :sub_steps` because StepResource serializes the sub-steps of every step;
+    # `visible_steps` filters in Ruby so the preload survives (see Workflow#visible_steps).
     workflows = Workflow.visible_for_project(current_project)
-                        .includes(:steps, :runs)
+                        .includes(:runs, steps: :sub_steps)
 
     render inertia: "Projects/Workflows/WorkflowsPage", props: {
       project: project_props,
       workflows: workflows.map { |w|
         WorkflowResource.new(w).to_h.merge(
-          steps: w.steps.not_deleted.map { |s| StepResource.new(s).to_h }
+          steps: w.visible_steps.map { |s| StepResource.new(s).to_h }
         )
       },
       configured_agents: current_project_membership&.configured_agents || [],
@@ -23,6 +25,10 @@ class Web::Company::Projects::WorkflowsController < Web::Company::Projects::Appl
       },
       repositories: InertiaRails.defer(group: "resources") {
         Repository.visible_for_project(current_project).map { |r| PickerResource.new(r).to_h }
+      },
+      # Names and types only — a config item's value never reaches a prop.
+      config_items: InertiaRails.defer(group: "resources") {
+        ConfigItem.visible_for_project(current_project).map { |r| ConfigItemPickerResource.new(r).to_h }
       },
       agent_models: InertiaRails.defer(group: "resources") {
         current_project_membership&.agent_models_for_props || []
@@ -38,7 +44,7 @@ class Web::Company::Projects::WorkflowsController < Web::Company::Projects::Appl
     render inertia: "Projects/Workflows/BuilderPage", props: {
       project: project_props,
       workflow: WorkflowResource.new(workflow).to_h,
-      steps: workflow.steps.not_deleted.map { |s| StepResource.new(s).to_h },
+      steps: workflow.visible_steps.map { |s| StepResource.new(s).to_h },
       read_only: workflow.scope_type == "Company",
       board_columns: current_project.board&.board_columns&.includes(column_workflow_binding: :workflow)&.map { |c|
         { id: c.id, name: c.name, bound_workflow_name: c.column_workflow_binding&.workflow&.name }
@@ -72,6 +78,10 @@ class Web::Company::Projects::WorkflowsController < Web::Company::Projects::Appl
       repositories: InertiaRails.defer(group: "resources") {
         Repository.visible_for_project(current_project).map { |r| PickerResource.new(r).to_h }
       },
+      # Names and types only — a config item's value never reaches a prop.
+      config_items: InertiaRails.defer(group: "resources") {
+        ConfigItem.visible_for_project(current_project).map { |r| ConfigItemPickerResource.new(r).to_h }
+      },
       agent_models: InertiaRails.defer(group: "resources") {
         current_project_membership&.agent_models_for_props || []
       }
@@ -82,6 +92,19 @@ class Web::Company::Projects::WorkflowsController < Web::Company::Projects::Appl
     workflow = current_project.workflows.new(workflow_params)
     if workflow.save
       redirect_to company_project_workflows_path(current_project), notice: "Workflow created"
+    else
+      redirect_to company_project_workflows_path(current_project), alert: workflow.errors.full_messages.join(", ")
+    end
+  end
+
+  # The Edit dialog on the workflows page. Goes through WorkflowService so a
+  # `config` edit merges into the existing hash instead of replacing it — the
+  # same write the builder's autosave performs through the API.
+  def update
+    workflow = current_project.workflows.active.find(params[:id])
+
+    if WorkflowService.update(workflow: workflow, params: workflow_params)
+      redirect_to company_project_workflows_path(current_project), notice: "Workflow updated"
     else
       redirect_to company_project_workflows_path(current_project), alert: workflow.errors.full_messages.join(", ")
     end

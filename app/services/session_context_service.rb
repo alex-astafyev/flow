@@ -50,6 +50,17 @@ class SessionContextService
       end
     end
 
+    # Values known to be secrets — the `secret` config items attached to the
+    # session — with no length floor. MIN_REDACT_LEN guards `redact` because it
+    # receives every MCP header/env value, secret or not; here every value was
+    # explicitly marked secret, and a short one is still a secret.
+    def redact_known_secrets(*values)
+      values.flatten.each do |value|
+        s = value.to_s
+        @secrets << s if s.present?
+      end
+    end
+
     def to_s
       lines = []
       lines << "=== Session Context Log ==="
@@ -80,13 +91,11 @@ class SessionContextService
 
     private
 
-    # Replace every registered secret with a fingerprint. Longest-first so a secret
-    # that is a substring of a longer one never corrupts the longer replacement.
+    # One implementation of the substitution, shared with the log-collection
+    # sinks — a second copy would drift and produce two different fingerprints
+    # for the same secret across artifacts of the same session.
     def scrub_secrets(text)
-      @secrets.uniq.sort_by { |s| -s.length }.each do |secret|
-        text = text.gsub(secret, "«redacted:sha256:#{Digest::SHA256.hexdigest(secret)[0, 8]}»")
-      end
-      text
+      Sessions::SecretRedactor.new(@secrets).call(text)
     end
   end
 
@@ -114,6 +123,10 @@ class SessionContextService
       # /var/log/context.log artifact (oauth-unification §7). The real values still
       # reach the container's MCP config files — only the log copy is redacted.
       context_log.redact(collect_context_secrets(resolved_servers, session))
+      # Config items attached to this session: the context file lists their
+      # NAMES, but a value could still reach the log through an MCP header that
+      # references the same item, so register them here too.
+      context_log.redact_known_secrets(Sessions::SecretRedactor.secret_values_for(session))
       context_log.record(:mcp_servers, mcp_server_names)
       Rails.logger.info("[SessionContext] Pre-resolved MCP server names: #{mcp_server_names.inspect}")
 
@@ -181,30 +194,6 @@ class SessionContextService
         write_file(container_id, expanded, content, adapter.container_uid)
         Rails.logger.info("[SessionContext] Injected config file: #{path} (#{content.bytesize} bytes)")
       end
-    end
-
-    # == Story 9.3: Environment Variable Resolution ==
-
-    # Resolve env vars from session_config, replacing config_item:NAME references
-    # with decrypted values from ConfigItem.
-    # @return [Hash] resolved { "KEY" => "value" } pairs
-    def resolve_env_vars(session)
-      vars = session.env_vars
-      return {} if vars.blank?
-
-      effective_items = resolve_effective_config_items(session)
-      resolved = {}
-
-      vars.each do |key, value|
-        resolved_value = resolve_config_item_reference(value, effective_items)
-        resolved[key] = resolved_value if resolved_value.present?
-      end
-
-      if resolved.any?
-        Rails.logger.info("[SessionContext] Resolved env vars: #{resolved.keys.join(', ')} (#{resolved.size} vars)")
-      end
-
-      resolved
     end
 
     # == Story 9.6: Skill Injection ==
@@ -371,8 +360,8 @@ class SessionContextService
       # Session-level requested model
       return session.requested_model if session.requested_model.present?
 
-      # User's default model from credential metadata
-      credential&.metadata&.dig("default_model")
+      # User's default model from credential metadata (retired ids mapped forward)
+      credential&.default_model
     end
 
     private
@@ -409,21 +398,6 @@ class SessionContextService
       return {} unless session.project.present?
 
       ConfigItem.effective_for_project(session.project)
-    end
-
-    # Resolve full config_item:NAME reference (for env vars where entire value is a ref)
-    def resolve_config_item_reference(value, effective_items)
-      return value unless value.to_s.start_with?("config_item:")
-
-      item_name = value.sub("config_item:", "")
-      resolved = effective_items[item_name]
-
-      unless resolved
-        Rails.logger.warn("[SessionContext] ConfigItem '#{item_name}' not found, skipping")
-        return nil
-      end
-
-      resolved
     end
 
     # Resolve embedded config_item:NAME references (for headers like "Bearer config_item:KEY")
@@ -770,14 +744,70 @@ class SessionContextService
         merged = existing.merge(new_data)
         write_file(container_id, path, merged.to_json, uid)
       when :append_toml
-        existing = read_file(container_id, path) || ""
-        write_file(container_id, path, "#{existing}\n\n#{content}", uid)
+        append_toml(container_id, path, content, uid)
       else # :fresh
         write_file(container_id, path, content, uid)
       end
     rescue JSON::ParserError => e
       Rails.logger.warn("[SessionContext] Failed to parse existing file #{path}: #{e.message}, writing fresh")
       write_file(container_id, path, content, uid)
+    end
+
+    # Appending is a read-modify-write, and `read_file` answers nil both for "the
+    # file is not there" and for "the read failed" — so the naive version wrote the
+    # MCP block on its own whenever a container hiccup swallowed the read, silently
+    # discarding everything the credential step had put in the same file. For Codex
+    # that file is config.toml, which holds the trusted-project entry: the result
+    # still parses, so the CLI starts and asks "Do you trust the contents of this
+    # directory?", and a non_interactive session has nobody to answer (task #605).
+    #
+    # An existing file we could not read is therefore left alone. Losing MCP servers
+    # surfaces as an agent reporting a missing tool; losing the trust entry surfaces
+    # as a workflow step that never speaks again.
+    def append_toml(container_id, path, content, uid)
+      existing = read_file(container_id, path)
+
+      if existing.nil?
+        presence = file_presence(container_id, path)
+
+        # Only positively established absence may be overwritten. A probe that
+        # errored answers :unknown, and the transient failure that swallowed the
+        # read is exactly the one likeliest to swallow the probe too — treating
+        # that as "absent" would recreate the loss this guard exists to prevent.
+        if presence != :absent
+          Rails.logger.error(
+            "[SessionContext] Skipped MCP append to #{path}: the file could not be read and its " \
+            "existence could not be ruled out (probe: #{presence}); overwriting it would drop the " \
+            "config already written there"
+          )
+          return false
+        end
+      end
+
+      write_file(container_id, path, "#{existing}\n\n#{content}", uid)
+    end
+
+    # Tri-state on purpose — see append_toml. A boolean would have to fold "the
+    # probe could not answer" into one of the two answers, and both foldings are
+    # wrong: `false` overwrites a file that may exist, `true` blocks the very
+    # first write on a container whose exec is merely slow to warm up.
+    #
+    # Absence is only established by `test -f` exiting 1 with a silent stderr,
+    # which is what the shell itself reports for a path that is not there. Any
+    # other exit code is the transport failing, not the file missing.
+    #
+    # @return [Symbol] :present, :absent or :unknown
+    def file_presence(container_id, path)
+      _stdout, stderr, exit_code = runtime.exec(
+        container_id, [ "/bin/sh", "-c", "test -f #{Shellwords.escape(path)}" ], stdout: true, stderr: true
+      )
+      return :present if exit_code.to_i.zero?
+      return :absent if exit_code.to_i == 1 && Array(stderr).join.strip.empty?
+
+      :unknown
+    rescue StandardError => e
+      Rails.logger.warn("[SessionContext] file_presence(#{path}) probe failed: #{e.message}")
+      :unknown
     end
 
     def runtime

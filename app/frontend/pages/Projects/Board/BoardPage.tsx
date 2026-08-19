@@ -10,8 +10,6 @@ import {
   useDroppable,
   type CollisionDetection,
   type DragEndEvent,
-  type DragOverEvent,
-  type DragStartEvent,
 } from '@dnd-kit/core';
 import {
   SortableContext,
@@ -19,7 +17,6 @@ import {
   horizontalListSortingStrategy,
   sortableKeyboardCoordinates,
   useSortable,
-  arrayMove,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { Head, router, usePage } from '@inertiajs/react';
@@ -31,12 +28,14 @@ import {
   Button,
   Card,
   Checkbox,
+  Combobox,
   Drawer,
   Group,
   Loader,
   Menu,
   Modal,
   Paper,
+  ScrollArea,
   Select,
   SimpleGrid,
   Skeleton,
@@ -48,8 +47,10 @@ import {
   ThemeIcon,
   Tooltip,
   UnstyledButton,
+  useCombobox,
 } from '@mantine/core';
 import { useForm } from '@mantine/form';
+import { useDebouncedValue } from '@mantine/hooks';
 import { modals } from '@mantine/modals';
 import {
   IconActivity,
@@ -93,7 +94,6 @@ import {
   IconTag,
   IconTrash,
   IconChartBar,
-  IconExternalLink,
   IconFileTypePdf,
   IconPlayerPlay,
   IconUser,
@@ -117,6 +117,7 @@ import { z } from 'zod';
 
 import { apiFetch } from 'shared/lib/apiFetch';
 import { formatDateTime } from 'shared/lib/formatDate';
+import { formatElapsedTime } from 'shared/lib/formatElapsedTime';
 import { useInertiaCableStream } from 'shared/lib/hooks/useInertiaCableStream';
 import { useLocalStorageSet } from 'shared/lib/hooks/useLocalStorage';
 import { useProjectPermissions } from 'shared/lib/hooks/useProjectPermissions';
@@ -144,7 +145,15 @@ import { PageHeader } from 'shared/ui/PageHeader';
 
 import { persistentProjectLayout, setPageLayout } from '../ProjectLayout';
 
+import { formatCostCents, formatDuration, formatTokens } from './boardFormat';
 import styles from './BoardPage.module.css';
+import { CHIP_TOOLTIP_PROPS } from './chipTooltip';
+import { GATE_CHIP_WIDTH, GateStatusChip } from './GateStatusChip';
+import { LatestRunTile } from './LatestRunTile';
+import { WORKFLOW_ACTIVE_STATES, type TaskWorkflowRun } from './taskRuns';
+import { TaskRunsPanel } from './TaskRunsPanel';
+import { useBoardDnd } from './useBoardDnd';
+import { useBoardTaskPages } from './useBoardTaskPages';
 
 const COMMENT_TAG_SUGGESTIONS = ['feedback', 'tech_design', 'code_review', 'qa_report', 'implementation_notes'];
 const AUTHOR_TYPES = [
@@ -175,6 +184,9 @@ interface Column {
   position: number;
   purpose: string | null;
   workflowBinding: WorkflowBinding | null;
+  // Every active task in the column, not just the loaded page — the column header count.
+  // Optional so a partial reload serialized before this field existed still types.
+  tasksCount?: number;
 }
 interface Workflow {
   id: number;
@@ -185,6 +197,17 @@ interface Gate {
   gateType: string;
   metadata: Record<string, unknown> & { repoFullName?: string; prNumber?: number; runId?: number };
   createdAt: string;
+  // `status` is the gate's lifecycle (pending / resolved / stale); `ciStatus` collapses it with the
+  // provider's verdict into the four states a board reader cares about: pending, succeeded, failed,
+  // stale. A stale gate is one reconciliation gave up on — see `diagnosticReason` for why.
+  status?: string;
+  ciStatus?: string;
+  conclusion?: string | null;
+  ageSeconds?: number;
+  expiresAt?: string | null;
+  expired?: boolean;
+  diagnosticReason?: string | null;
+  source?: { provider?: string; repoFullName?: string; referenceType?: string; reference?: unknown };
 }
 
 interface Task {
@@ -201,6 +224,9 @@ interface Task {
   // Serialized only on the task detail payload (TaskDetailResource), so the drawer can name the
   // parent epic even when the epic is archived and therefore absent from the board's task list.
   parentTaskTitle?: string | null;
+  // Also detail-payload-only: an epic's children, which a board holding one page per column can
+  // no longer be filtered for.
+  childTasks?: Array<{ id: number; title: string; taskType: string }>;
   tags: string[];
   archived: boolean;
   commentsCount: number;
@@ -215,6 +241,10 @@ interface Task {
     errorMessage?: string | null;
   }>;
   pendingGates: Gate[];
+  // Every CI gate the task has had, newest first — pending, passed, failed and stale alike, which is
+  // what lets a card say which of those four things CI is currently doing. Optional so a payload
+  // serialized before this field existed (or a partial reload) still types.
+  ciGates?: Gate[];
   createdAt: string;
   updatedAt: string;
 }
@@ -243,7 +273,12 @@ interface Props {
   board: Board | null;
   boardPresets?: BoardPreset[];
   columns: Column[];
+  // First page of each column only; the rest arrives through useBoardTaskPages.
   tasks: Task[];
+  tasksPageSize?: number;
+  // Board-wide filter/picker options, which can no longer be derived from `tasks`.
+  boardTags?: string[];
+  epics?: Array<{ id: number; title: string }>;
   members: Member[];
   workflows: Workflow[];
   viewPresets?: ViewPreset[];
@@ -275,7 +310,9 @@ const PRIORITY_COLORS: Record<string, string> = {
   low: 'var(--app-success-fg)',
 };
 
-const WORKFLOW_ACTIVE_STATES = new Set(['pending', 'running', 'paused']);
+// Gate states that still hold the column auto-trigger or still need a person — the only ones worth
+// offering a delete button for.
+const GATE_UNRESOLVED_STATUSES = new Set(['pending', 'stale']);
 
 // Helper to get workflow status indicator color
 const workflowStatusColor = (state: string): string => {
@@ -293,24 +330,6 @@ const CHART_TOOLTIP_STYLE: React.CSSProperties = {
   fontSize: 12,
   color: 'var(--app-text-primary)',
 };
-
-function formatCostCents(cents: number): string {
-  return cents >= 100 ? `$${(cents / 100).toFixed(2)}` : `${cents}¢`;
-}
-
-function formatTokens(tokens: number): string {
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
-  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
-  return `${tokens}`;
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return `${h}h ${m}m`;
-}
 
 interface BoardFilters {
   assigneeId: string | null;
@@ -358,11 +377,15 @@ function SortableTaskCard({
   href,
   onClick,
   onRetry,
+  onTagClick,
+  activeTags,
 }: {
   task: Task;
   href?: string;
   onClick?: (t: Task) => void;
   onRetry?: (task: Task) => void;
+  onTagClick?: (tag: string) => void;
+  activeTags?: string[];
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: `task-${task.id}`,
@@ -382,17 +405,170 @@ function SortableTaskCard({
 
   return (
     <Box ref={setNodeRef} style={style} {...attributes} {...listeners}>
-      <TaskCardUI task={task} href={href} onClick={onClick} onRetry={onRetry} />
+      <TaskCardUI
+        task={task}
+        href={href}
+        onClick={onClick}
+        onRetry={onRetry}
+        onTagClick={onTagClick}
+        activeTags={activeTags}
+      />
     </Box>
   );
+}
+
+// What a gate's CI state is, tolerating a payload that predates ciStatus: a gate the server did not
+// classify is pending unless it says otherwise.
+function gateCiStatus(gate: Gate): string {
+  return gate.ciStatus ?? gate.status ?? 'pending';
+}
+
+// The CI verdict a card advertises, from the newest CI gate the task has: which of the four states
+// (waiting / passed / failed / stale) it is in, and the one-line reason a reader needs. Stale is its
+// own state on purpose — it means "no CI verdict was ever obtained", which is neither a pass nor a
+// failure, and it is the state a lost webhook now lands in instead of waiting forever.
+function ciGateSummary(task: Task): { label: string; color: string; tooltip: string } | null {
+  const gate = (task.ciGates ?? [])[0];
+  if (!gate) return null;
+
+  const kind = gateCiStatus(gate);
+  const name = gate.gateType.replace(/_/g, ' ');
+
+  switch (kind) {
+    case 'stale':
+      return {
+        label: 'CI stale',
+        color: 'orange',
+        tooltip: gate.diagnosticReason
+          ? `${name} — stale: ${gate.diagnosticReason}`
+          : `${name} — no CI result was ever obtained`,
+      };
+    case 'failed':
+      return {
+        label: 'CI failed',
+        color: 'red',
+        tooltip: `${name} — ${gate.conclusion ?? 'failed'}`,
+      };
+    case 'succeeded':
+      return { label: 'CI passed', color: 'green', tooltip: `${name} — ${gate.conclusion ?? 'success'}` };
+    default:
+      return {
+        label: 'CI pending',
+        color: 'yellow',
+        tooltip: `${name} — waiting ${formatElapsedTime(gate.createdAt)}${gate.expired ? ' (past its TTL)' : ''}`,
+      };
+  }
+}
+
+// The part of a gate's story its chip does NOT already tell, as a short muted suffix. The state
+// itself is the chip's label, so repeating it here would only be noise; age is not — "waiting"
+// reads very differently at two minutes and at eleven hours — and neither is a failure that ended
+// in something other than a plain failed check (timed out, cancelled, action required).
+function gateDetail(gate: Gate): string | null {
+  const kind = gateCiStatus(gate);
+  if (kind === 'succeeded') return null;
+  if (kind === 'failed') {
+    const conclusion = gate.conclusion;
+    if (!conclusion || conclusion === 'failure' || conclusion === 'failed') return null;
+    return conclusion.replace(/_/g, ' ');
+  }
+
+  const elapsed = formatElapsedTime(gate.createdAt);
+  if (kind === 'stale') return elapsed;
+  return gate.expired ? `${elapsed} · past TTL` : elapsed;
+}
+
+// What the chip's tooltip spells out: the gate type the row no longer prints as a pill, plus the
+// provider's own conclusion when there is one worth naming — and, for a stale gate, why
+// reconciliation gave up. That last one is a sentence of prose, not a label: it rides in the
+// tooltip so a stale row stays as compact as every other one, worded the same way the card's CI
+// summary chip words it.
+function gateTooltip(gate: Gate): string {
+  const name = gate.gateType.replace(/_/g, ' ');
+  if (gateCiStatus(gate) === 'stale') {
+    return gate.diagnosticReason
+      ? `${name} — stale: ${gate.diagnosticReason}`
+      : `${name} — stale: no CI result was ever obtained`;
+  }
+  return gate.conclusion ? `${name} — ${gate.conclusion}` : name;
+}
+
+// The provider page a gate row links to: the pull request for a checks gate, the run page for a
+// workflow gate. Null when the metadata a link needs was never recorded.
+function gateLink(gate: Gate): { href: string; label: string; kind: 'pr' | 'run' } | null {
+  const repo = gate.metadata.repoFullName;
+  if (!repo) return null;
+
+  if (gate.gateType === 'github_checks_completed' && gate.metadata.prNumber) {
+    return {
+      href: `https://github.com/${repo}/pull/${gate.metadata.prNumber}`,
+      label: `${repo} #${gate.metadata.prNumber}`,
+      kind: 'pr',
+    };
+  }
+  if (gate.gateType === 'github_workflow_completed' && gate.metadata.runId) {
+    return {
+      href: `https://github.com/${repo}/actions/runs/${gate.metadata.runId}`,
+      label: `${repo} #${gate.metadata.runId}`,
+      kind: 'run',
+    };
+  }
+  return null;
+}
+
+// Status a collapsed ticket chip advertises: the bar colour and the hover tooltip both come
+// from here, so the folded strip still tells you which tickets are running, failed or waiting
+// without unfolding the column.
+function collapsedTaskStatus(task: Task): { color: string; hasActiveRun: boolean; tooltipLabel: string } {
+  const latestRun = task.recentWorkflowRuns?.[0];
+  const hasPendingGates = (task.pendingGates?.length ?? 0) > 0;
+  const staleGate = (task.ciGates ?? []).find((g) => gateCiStatus(g) === 'stale');
+
+  let color = 'var(--app-text-tertiary)';
+  let hasActiveRun = false;
+  if (latestRun) {
+    color = workflowStatusColor(latestRun.state);
+    hasActiveRun = WORKFLOW_ACTIVE_STATES.has(latestRun.state);
+  }
+  // A pending gate outranks the run state: the ticket is parked, so it must not read as active.
+  if (hasPendingGates) {
+    color = 'var(--app-warning-fg)';
+    hasActiveRun = false;
+  }
+  // A stale gate outranks a pending one: nobody is going to resolve it, so it needs a human.
+  if (staleGate) {
+    color = 'var(--app-danger-fg)';
+    hasActiveRun = false;
+  }
+
+  const tooltipParts: string[] = [task.title];
+  if (latestRun) {
+    if (latestRun.state === 'running' && latestRun.createdAt) {
+      tooltipParts.push(`Running — ${formatElapsedTime(latestRun.createdAt)}`);
+    } else {
+      tooltipParts.push(`Status: ${latestRun.state}`);
+    }
+  }
+  if (hasPendingGates) {
+    const oldestGate = task.pendingGates.reduce((a, b) => (a.createdAt < b.createdAt ? a : b));
+    tooltipParts.push(`Waiting — ${formatElapsedTime(oldestGate.createdAt)}`);
+  }
+  if (staleGate) {
+    tooltipParts.push(`CI stale — ${staleGate.diagnosticReason ?? 'no CI result'}`);
+  }
+
+  return { color, hasActiveRun, tooltipLabel: tooltipParts.join(' · ') };
 }
 
 // A compact, draggable stand-in for a task shown inside a collapsed column strip.
 // It keeps the ticket present in the DOM as a sortable item so a drag can still be
 // initiated from a collapsed source column (board requirement 3). It renders no task
-// title text — only a small grab bar — so a collapsed column stays lightweight and does
-// not reveal card content while folded.
-function CollapsedTaskChip({ task }: { task: Task }) {
+// title text — only a small status bar — so a collapsed column stays lightweight and does
+// not reveal card content while folded; the title and run status live in the tooltip.
+// Clicking a chip opens the task detail sidebar, the same as clicking a full card in an
+// expanded column. The pointer sensor only starts a drag past an 8px threshold, so a plain
+// click still reaches onClick and dragging the chip out of the column is unaffected.
+function CollapsedTaskChip({ task, onClick }: { task: Task; onClick?: (t: Task) => void }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: `task-${task.id}`,
     data: { type: 'task', task },
@@ -404,24 +580,29 @@ function CollapsedTaskChip({ task }: { task: Task }) {
     opacity: isDragging ? 0.4 : 1,
   };
 
+  const { color, hasActiveRun, tooltipLabel } = collapsedTaskStatus(task);
+
   return (
-    <Box
-      ref={setNodeRef}
-      aria-label={`Drag ${task.title}`}
-      title={task.title}
-      style={{
-        ...style,
-        width: 30,
-        height: 12,
-        borderRadius: 3,
-        backgroundColor: 'var(--app-border-default)',
-        cursor: 'grab',
-        touchAction: 'none',
-        flexShrink: 0,
-      }}
-      {...attributes}
-      {...listeners}
-    />
+    <Tooltip {...CHIP_TOOLTIP_PROPS} label={tooltipLabel}>
+      <Box
+        ref={setNodeRef}
+        aria-label={`Drag ${task.title}`}
+        onClick={() => onClick?.(task)}
+        style={{
+          ...style,
+          width: 30,
+          height: 12,
+          borderRadius: 3,
+          backgroundColor: color,
+          cursor: 'grab',
+          touchAction: 'none',
+          flexShrink: 0,
+          animation: hasActiveRun ? 'priorityBarPulse 2s ease-in-out infinite' : undefined,
+        }}
+        {...attributes}
+        {...listeners}
+      />
+    </Tooltip>
   );
 }
 
@@ -431,16 +612,28 @@ function TaskCardUI({
   onClick,
   isDragOverlay,
   onRetry,
+  onTagClick,
+  activeTags,
 }: {
   task: Task;
   href?: string;
   onClick?: (t: Task) => void;
   isDragOverlay?: boolean;
   onRetry?: (task: Task) => void;
+  onTagClick?: (tag: string) => void;
+  activeTags?: string[];
 }) {
-  const visibleTags = (task.tags ?? []).slice(0, 3);
-  const overflowCount = (task.tags ?? []).length - 3;
+  // A card shows at most three tags. Whichever ones the board is filtered by come first, so the
+  // filter that put this card on screen is always the one you can click to take it back off.
+  const cardTags = (activeTags ?? []).length
+    ? [...(task.tags ?? [])].sort(
+        (a, b) => Number((activeTags ?? []).includes(b)) - Number((activeTags ?? []).includes(a)),
+      )
+    : (task.tags ?? []);
+  const visibleTags = cardTags.slice(0, 3);
+  const overflowCount = cardTags.length - 3;
 
+  const ciSummary = ciGateSummary(task);
   const latestRun = (task.recentWorkflowRuns ?? [])[0] ?? null;
   const isRunning = latestRun && WORKFLOW_ACTIVE_STATES.has(latestRun.state);
   const isFailed = latestRun?.state === 'failed';
@@ -522,29 +715,60 @@ function TaskCardUI({
         </Text>
       </Group>
 
-      {/* Workflow status chip — filled colored badge (AC-11) */}
+      {/* Workflow status chip — filled colored badge (AC-11). The chip names only the latest run,
+          so the tooltip keeps listing every recent run's state as it did before the board redesign. */}
       {latestRun && dotColor && runLabel && (
-        <Group gap={4} mt={6} align="center">
-          <ActionIcon size="xs" variant="subtle" color="orange" style={{ cursor: 'default', flexShrink: 0 }}>
-            <IconBolt size={11} />
-          </ActionIcon>
-          <Badge
-            size="xs"
-            variant="filled"
-            color={isFailed ? 'red' : isRunning ? 'orange' : 'green'}
-            leftSection={
-              <Box
-                w={5}
-                h={5}
-                className={isRunning ? styles.workflowDotActive : undefined}
-                style={{ borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.7)', flexShrink: 0 }}
-              />
-            }
-            style={{ fontSize: 10, cursor: 'default', textTransform: 'uppercase', letterSpacing: 0.3 }}
-          >
-            {isFailed ? 'Failed' : isRunning ? 'Running' : 'Succeeded'}
-          </Badge>
-        </Group>
+        <Tooltip label={(task.recentWorkflowRuns ?? []).map((r) => r.state).join(', ')}>
+          <Group gap={4} mt={6} align="center">
+            <ActionIcon size="xs" variant="subtle" color="orange" style={{ cursor: 'default', flexShrink: 0 }}>
+              <IconBolt size={11} />
+            </ActionIcon>
+            <Badge
+              size="xs"
+              variant="filled"
+              color={isFailed ? 'red' : isRunning ? 'orange' : 'green'}
+              leftSection={
+                <Box
+                  w={5}
+                  h={5}
+                  className={isRunning ? styles.workflowDotActive : undefined}
+                  style={{ borderRadius: '50%', backgroundColor: 'rgba(255,255,255,0.7)', flexShrink: 0 }}
+                />
+              }
+              style={{ fontSize: 10, cursor: 'default', textTransform: 'uppercase', letterSpacing: 0.3 }}
+            >
+              {isFailed ? 'Failed' : isRunning ? 'Running' : 'Succeeded'}
+            </Badge>
+          </Group>
+        </Tooltip>
+      )}
+
+      {/* CI chip — the card's own answer to "what is CI doing?", kept separate from the workflow
+          chip above because a green run and a red CI are entirely compatible states. */}
+      {ciSummary && (
+        <Tooltip label={ciSummary.tooltip} multiline maw={320}>
+          <Group gap={4} mt={6} align="center">
+            <Badge
+              size="xs"
+              variant="filled"
+              color={ciSummary.color}
+              leftSection={
+                ciSummary.label === 'CI stale' ? (
+                  <IconAlertCircle size={9} />
+                ) : ciSummary.label === 'CI passed' ? (
+                  <IconCircleCheck size={9} />
+                ) : ciSummary.label === 'CI failed' ? (
+                  <IconX size={9} />
+                ) : (
+                  <IconHourglass size={9} />
+                )
+              }
+              style={{ fontSize: 10, cursor: 'default', textTransform: 'uppercase', letterSpacing: 0.3 }}
+            >
+              {ciSummary.label}
+            </Badge>
+          </Group>
+        </Tooltip>
       )}
 
       {/* Type chip + tags */}
@@ -568,11 +792,40 @@ function TaskCardUI({
             {task.taskType}
           </Badge>
         )}
-        {visibleTags.map((tag) => (
-          <Badge key={tag} size="xs" variant="outline" color="gray" style={{ fontSize: 10 }}>
-            {tag}
-          </Badge>
-        ))}
+        {visibleTags.map((tag) => {
+          const isFiltered = (activeTags ?? []).includes(tag);
+          if (!onTagClick) {
+            return (
+              <Badge key={tag} size="xs" variant="outline" color="gray" style={{ fontSize: 10 }}>
+                {tag}
+              </Badge>
+            );
+          }
+          return (
+            // A tag on a card is the shortest path to "show me the other tasks like this one", so it
+            // toggles the board's tag filter. The card itself is a link and a drag handle, hence both
+            // the click (open task) and the pointerdown (start drag) stop here.
+            <Badge
+              key={tag}
+              component="button"
+              type="button"
+              size="xs"
+              variant={isFiltered ? 'filled' : 'outline'}
+              color="gray"
+              aria-pressed={isFiltered}
+              title={isFiltered ? `Remove tag filter ${tag}` : `Filter board by tag ${tag}`}
+              onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
+              onClick={(e: React.MouseEvent) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onTagClick(tag);
+              }}
+              style={{ fontSize: 10, cursor: 'pointer' }}
+            >
+              {tag}
+            </Badge>
+          );
+        })}
         {overflowCount > 0 && (
           <Badge size="xs" variant="outline" color="gray" style={{ fontSize: 10 }}>
             +{overflowCount}
@@ -668,10 +921,16 @@ function TaskCardUI({
 function BoardColumn({
   column,
   tasks,
+  totalCount,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   taskHref,
   onAddTask,
   onTaskClick,
   onRetryTask,
+  onTagClick,
+  activeTags,
   collapsed,
   onToggleCollapse,
   onMoveLeft,
@@ -683,11 +942,19 @@ function BoardColumn({
   canExecute,
 }: {
   column: Column;
+  /** The pages of this column the client has loaded — not necessarily all of it. */
   tasks: Task[];
+  /** Every task in the column, which is what the header count means. */
+  totalCount: number;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: (columnId: number) => void;
   taskHref: (task: Task) => string;
   onAddTask: (columnId: number) => void;
   onTaskClick: (task: Task) => void;
   onRetryTask: (task: Task) => void;
+  onTagClick: (tag: string) => void;
+  activeTags: string[];
   collapsed: boolean;
   onToggleCollapse: (id: number) => void;
   onMoveLeft?: () => void;
@@ -753,6 +1020,14 @@ function BoardColumn({
     const val = renameValue.trim();
     if (!val || val === column.name) return;
     onRenameColumn?.(column.id, val);
+  };
+
+  // Infinite scroll: the next page is pulled as the column nears its end. The Load more button
+  // below stays as the explicit (and keyboard-reachable) way to do the same thing.
+  const handleScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    if (!hasMore || loadingMore) return;
+    const { scrollTop, scrollHeight, clientHeight } = event.currentTarget;
+    if (scrollHeight - scrollTop - clientHeight <= LOAD_MORE_SCROLL_THRESHOLD_PX) onLoadMore(column.id);
   };
 
   if (collapsed) {
@@ -825,7 +1100,7 @@ function BoardColumn({
             flexShrink: 0,
           }}
         >
-          {tasks.length}
+          {totalCount}
         </div>
 
         {/* Workflow status indicator for automated columns */}
@@ -844,7 +1119,9 @@ function BoardColumn({
         )}
 
         {/* Draggable ticket chips — keep the tickets reachable so they can be dragged out of a
-            collapsed source column (board requirement 3). No title text is rendered here. */}
+            collapsed source column (board requirement 3). No title text is rendered here.
+            A chip click opens the task detail sidebar; stopPropagation keeps it from also
+            hitting the column's expand toggle. */}
         {tasks.length > 0 && (
           <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
             <Box
@@ -860,7 +1137,7 @@ function BoardColumn({
               }}
             >
               {tasks.map((task) => (
-                <CollapsedTaskChip key={task.id} task={task} />
+                <CollapsedTaskChip key={task.id} task={task} onClick={onTaskClick} />
               ))}
             </Box>
           </SortableContext>
@@ -943,25 +1220,29 @@ function BoardColumn({
               styles={{ input: { fontSize: 13, fontWeight: 600, padding: '0 0 0 4px' } }}
             />
           ) : (
-            <Text
-              {...colListeners}
-              fw={600}
-              title="Drag to reorder column"
-              style={{
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                fontSize: 13,
-                color: 'var(--mantine-color-text)',
-                cursor: 'grab',
-                touchAction: 'none',
-              }}
-            >
-              {column.name}
-            </Text>
+            // A column that declares a purpose explains it on hover, as it did before the board
+            // redesign. Without a purpose the name keeps the plain drag-affordance title.
+            <Tooltip label={column.purpose} multiline w={200} disabled={!column.purpose}>
+              <Text
+                {...colListeners}
+                fw={600}
+                title={column.purpose ? undefined : 'Drag to reorder column'}
+                style={{
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  fontSize: 13,
+                  color: 'var(--mantine-color-text)',
+                  cursor: 'grab',
+                  touchAction: 'none',
+                }}
+              >
+                {column.name}
+              </Text>
+            </Tooltip>
           )}
           <Text fw={500} c="dimmed" style={{ flexShrink: 0, fontSize: 12 }}>
-            {tasks.length}
+            {totalCount}
           </Text>
           {column.workflowBinding && (
             <Tooltip label={column.workflowBinding.workflowName ?? 'Automation'} withArrow>
@@ -1086,10 +1367,10 @@ function BoardColumn({
         </Group>
       </Box>
 
-      {/* Task list */}
+      {/* Task list — one page at a time, extended as it is scrolled */}
       <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
-        <Box style={{ flex: 1, overflowY: 'auto', padding: '0 12px 12px', minHeight: 60 }}>
-          {tasks.length === 0 ? (
+        <Box onScroll={handleScroll} style={{ flex: 1, overflowY: 'auto', padding: '0 12px 12px', minHeight: 60 }}>
+          {tasks.length === 0 && !loadingMore ? (
             <Text size="xs" c="dimmed" ta="center" py="xl">
               {isFiltered ? 'No matching tasks' : 'No tasks yet'}
             </Text>
@@ -1101,8 +1382,22 @@ function BoardColumn({
                 href={taskHref(task)}
                 onClick={onTaskClick}
                 onRetry={onRetryTask}
+                onTagClick={onTagClick}
+                activeTags={activeTags}
               />
             ))
+          )}
+          {hasMore && (
+            <Button
+              variant="subtle"
+              size="xs"
+              fullWidth
+              mt={4}
+              loading={loadingMore}
+              onClick={() => onLoadMore(column.id)}
+            >
+              {`Load more (${tasks.length} of ${totalCount})`}
+            </Button>
           )}
         </Box>
       </SortableContext>
@@ -1187,26 +1482,6 @@ async function deleteTaskGate(projectId: number, taskId: number, gateId: number)
   }
 }
 
-interface TaskWorkflowRun {
-  id: number;
-  workflowName: string;
-  state: string;
-  mode: string;
-  startedAt: string | null;
-  completedAt: string | null;
-  createdAt: string;
-  totalCostCents?: number;
-  totalTokens?: number;
-  durationSeconds?: number;
-  steps?: Array<{
-    name: string;
-    state: string;
-    startedAt: string | null;
-    finishedAt: string | null;
-    durationSeconds: number | null;
-  }>;
-}
-
 function useBoardActivitiesLoadMore(projectId: number, initialActivities: ActivityItem[]) {
   const [extraActivities, setExtraActivities] = useState<ActivityItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1263,65 +1538,44 @@ interface TaskStatistics {
   }>;
 }
 
-// --- Neutral Status Chip (AC-13, AC-28) ---
-
-function NeutralStatusChip({ state, size = 'xs' }: { state: string; size?: string }) {
-  const isRunning = WORKFLOW_ACTIVE_STATES.has(state);
-  const isSuccess = state === 'completed' || state === 'succeeded';
-  const isFailed = state === 'failed';
-  let dotColor = 'var(--mantine-color-gray-5)';
-  if (isRunning) dotColor = 'var(--app-warning-fg)';
-  else if (isSuccess) dotColor = 'var(--app-success-fg)';
-  else if (isFailed) dotColor = 'var(--app-danger-fg)';
-
-  return (
-    <Badge
-      size={size as 'xs' | 'sm'}
-      variant="outline"
-      color="gray"
-      leftSection={
-        <Box
-          w={6}
-          h={6}
-          className={isRunning ? styles.workflowDotActive : undefined}
-          style={{ borderRadius: '50%', backgroundColor: dotColor, flexShrink: 0 }}
-        />
-      }
-      style={{ fontSize: 10, cursor: 'default' }}
-    >
-      {state}
-    </Badge>
-  );
-}
-
 // --- Inline tags editor (matches reference .tag / .add-tag / .tag-input pattern) ---
 
 function InlineTagsEditor({
   tags,
   onChange,
   disabled,
+  suggestions,
 }: {
   tags: string[];
   onChange: (tags: string[]) => void;
   disabled?: boolean;
+  suggestions?: string[];
 }) {
   const [inputVisible, setInputVisible] = useState(false);
   const [inputValue, setInputValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const combobox = useCombobox({ onDropdownClose: () => combobox.resetSelectedOption() });
+
+  // Tags the board already uses, minus the ones on this task — picking from these is what keeps
+  // "frontend" from silently becoming "front-end" on the next task.
+  const options = useMemo(() => {
+    const query = inputValue.trim().toLowerCase();
+    return (suggestions ?? []).filter((s) => !tags.includes(s) && (query === '' || s.toLowerCase().includes(query)));
+  }, [suggestions, tags, inputValue]);
 
   const showInput = () => {
     setInputVisible(true);
     setTimeout(() => inputRef.current?.focus(), 0);
   };
 
-  const commitTag = () => {
-    const trimmed = inputValue.trim();
-    if (trimmed && !tags.includes(trimmed)) {
-      onChange([...tags, trimmed]);
-    }
+  const addTag = (tag: string) => {
+    if (tag && !tags.includes(tag)) onChange([...tags, tag]);
     setInputValue('');
     setInputVisible(false);
+    combobox.closeDropdown();
   };
+
+  const commitTag = () => addTag(inputValue.trim());
 
   const removeTag = (tag: string) => onChange(tags.filter((t) => t !== tag));
 
@@ -1412,39 +1666,65 @@ function InlineTagsEditor({
         </Box>
       )}
       {!disabled && inputVisible && (
-        <input
-          ref={inputRef}
-          value={inputValue}
-          onChange={(e) => setInputValue(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              commitTag();
-            }
-            if (e.key === 'Escape') {
-              e.preventDefault();
-              setInputValue('');
-              setInputVisible(false);
-            }
-          }}
-          onBlur={() => {
-            // Only commit on blur if still in input mode (Escape key sets inputVisible=false)
-            if (inputVisible) commitTag();
-          }}
-          placeholder="Tag name"
-          style={{
-            width: 120,
-            background: 'var(--app-bg-paper)',
-            border: '1px solid var(--app-primary)',
-            borderRadius: 5,
-            fontFamily: 'inherit',
-            fontSize: 12,
-            padding: '4px 10px',
-            lineHeight: 1,
-            color: 'var(--mantine-color-text)',
-            outline: 'none',
-          }}
-        />
+        <Combobox store={combobox} position="bottom-start" shadow="md" withinPortal onOptionSubmit={addTag}>
+          <Combobox.Target>
+            <input
+              ref={inputRef}
+              value={inputValue}
+              aria-label="Tag name"
+              onFocus={() => combobox.openDropdown()}
+              onChange={(e) => {
+                setInputValue(e.currentTarget.value);
+                combobox.openDropdown();
+                combobox.resetSelectedOption();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  // An arrow-key-highlighted suggestion wins over the raw text: Mantine's own
+                  // handler runs right after this one and submits the option.
+                  if (combobox.getSelectedOptionIndex() !== -1) return;
+                  e.preventDefault();
+                  commitTag();
+                }
+                if (e.key === 'Escape') {
+                  // First Escape dismisses the suggestions, a second one leaves the input.
+                  if (combobox.dropdownOpened) return;
+                  e.preventDefault();
+                  setInputValue('');
+                  setInputVisible(false);
+                }
+              }}
+              onBlur={() => {
+                // Only commit on blur if still in input mode (Escape key sets inputVisible=false)
+                if (inputVisible) commitTag();
+              }}
+              placeholder="Tag name"
+              style={{
+                width: 120,
+                background: 'var(--app-bg-paper)',
+                border: '1px solid var(--app-primary)',
+                borderRadius: 5,
+                fontFamily: 'inherit',
+                fontSize: 12,
+                padding: '4px 10px',
+                lineHeight: 1,
+                color: 'var(--mantine-color-text)',
+                outline: 'none',
+              }}
+            />
+          </Combobox.Target>
+          <Combobox.Dropdown hidden={options.length === 0}>
+            <Combobox.Options>
+              <ScrollArea.Autosize mah={180} type="scroll">
+                {options.map((tag) => (
+                  <Combobox.Option value={tag} key={tag}>
+                    <Text size="xs">{tag}</Text>
+                  </Combobox.Option>
+                ))}
+              </ScrollArea.Autosize>
+            </Combobox.Options>
+          </Combobox.Dropdown>
+        </Combobox>
       )}
     </Box>
   );
@@ -1455,9 +1735,11 @@ function InlineTagsEditor({
 function TaskDetailSidebar({
   task,
   allTasks,
+  epics,
+  knownTags,
   onClose,
   onDelete,
-  onOpenTask,
+  onOpenTaskId,
   projectId,
   columns,
   members,
@@ -1469,10 +1751,16 @@ function TaskDetailSidebar({
   canExecute,
 }: {
   task: Task | null;
+  /** The pages the board holds — a fallback source, not the whole board. */
   allTasks: Task[];
+  /** Every epic on the board, for the Parent Epic picker. */
+  epics: Array<{ id: number; title: string }>;
+  /** Every tag on the board, offered as autocomplete when tagging this task. */
+  knownTags: string[];
   onClose: () => void;
   onDelete: (taskId: number) => void;
-  onOpenTask: (task: Task) => void;
+  /** Opens a task by id — the board may hold no card for it (an unloaded child or parent). */
+  onOpenTaskId: (taskId: number) => void;
   projectId: number;
   columns: Column[];
   members: Member[];
@@ -1500,7 +1788,6 @@ function TaskDetailSidebar({
   const [triggeringWorkflow, setTriggeringWorkflow] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [deletingGateId, setDeletingGateId] = useState<number | null>(null);
-  const [showAllSteps, setShowAllSteps] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -1518,12 +1805,29 @@ function TaskDetailSidebar({
     });
   }, [comments, authorFilter, tagFilter]);
 
-  const epicTasks = useMemo(
-    () => allTasks.filter((t) => t.taskType === 'epic' && t.id !== task?.id),
-    [allTasks, task?.id],
-  );
+  // Board-wide epics, from their own prop: the loaded pages hold only some of them.
+  const epicTasks = useMemo(() => epics.filter((e) => e.id !== task?.id), [epics, task?.id]);
 
-  const childTasks = useMemo(() => allTasks.filter((t) => t.parentTaskId === task?.id), [allTasks, task?.id]);
+  // Children come with the task payload. The board-derived list is the fallback for a render that
+  // has not received the detail payload yet (a card opened straight from a partial reload).
+  const childTasks = useMemo(() => {
+    if (task?.childTasks) {
+      return task.childTasks.map((c) => ({ id: c.id, title: c.title, taskType: c.taskType }));
+    }
+    return allTasks
+      .filter((t) => t.parentTaskId === task?.id)
+      .map((t) => ({ id: t.id, title: t.title, taskType: t.taskType }));
+  }, [task?.childTasks, allTasks, task?.id]);
+
+  // The drawer lists the task's whole CI history, not only what is still blocking it: a failed or a
+  // stale gate is the most interesting thing on a card, and both have already left `pendingGates`.
+  // The fallback keeps the panel working for a payload serialized before `ciGates` existed.
+  const gatesForPanel = useMemo<Gate[]>(() => {
+    const history = task?.ciGates ?? [];
+    return history.length > 0 ? history : (task?.pendingGates ?? []);
+  }, [task?.ciGates, task?.pendingGates]);
+
+  const hasStaleGate = useMemo(() => gatesForPanel.some((gate) => gateCiStatus(gate) === 'stale'), [gatesForPanel]);
 
   const parentTask = useMemo(
     () => (task?.parentTaskId ? allTasks.find((t) => t.id === task.parentTaskId) : null) ?? null,
@@ -1533,7 +1837,15 @@ function TaskDetailSidebar({
   // The board only loads active tasks, so an archived parent epic is absent from `allTasks`.
   // The serialized parentTaskTitle keeps the link visible (and the select's current value
   // selectable) even when the epic itself was never loaded onto the board.
-  const parentTaskTitle = parentTask?.title ?? task?.parentTaskTitle ?? null;
+  // The epic may be on a page this board has not loaded; it is still openable by id, and the
+  // epics prop names it. Only a task missing from both (an archived epic) has no card to open.
+  const parentEpic = useMemo(
+    () => (task?.parentTaskId ? epics.find((e) => e.id === task.parentTaskId) : undefined) ?? null,
+    [epics, task?.parentTaskId],
+  );
+  const parentLinkId = parentTask?.id ?? parentEpic?.id ?? null;
+
+  const parentTaskTitle = parentTask?.title ?? parentEpic?.title ?? task?.parentTaskTitle ?? null;
 
   // Options for the Parent Epic select: every epic on the board, plus the current parent when
   // it is not among them — without it Mantine has no option matching `value` and renders blank.
@@ -1682,6 +1994,12 @@ function TaskDetailSidebar({
   const columnWorkflowBinding = taskColumn?.workflowBinding ?? null;
   const hasActiveRun = (task.recentWorkflowRuns ?? []).some((r) => WORKFLOW_ACTIVE_STATES.has(r.state));
   const canTriggerWorkflow = columnWorkflowBinding && !hasActiveRun;
+  // A task keeps its run history wherever it is parked — a workflow that finishes usually moves the
+  // task out of the bound column, and gating the run surfaces on the binding hid the history (and
+  // the session shortcut) exactly then. The runs themselves decide; the binding only decides whether
+  // a *new* run can be started from here (canTriggerWorkflow).
+  const hasRuns = (workflowRuns ?? []).length > 0;
+  const showRuns = !!columnWorkflowBinding || hasRuns;
   const assetsCount = (taskAssets ?? []).length || task.assetsCount || 0;
 
   return (
@@ -1775,7 +2093,7 @@ function TaskDetailSidebar({
       >
         <Tabs.List>
           <Tabs.Tab value="details">Details</Tabs.Tab>
-          {columnWorkflowBinding && <Tabs.Tab value="runs">Runs ({(workflowRuns ?? []).length})</Tabs.Tab>}
+          {showRuns && <Tabs.Tab value="runs">Runs ({(workflowRuns ?? []).length})</Tabs.Tab>}
           <Tabs.Tab value="comments">
             Comments ({(comments ?? []).length > 0 ? (comments ?? []).length : task.commentsCount})
           </Tabs.Tab>
@@ -1930,115 +2248,10 @@ function TaskDetailSidebar({
             )}
           </Box>
 
-          {/* Latest run summary (AC-19) — only for automated columns */}
-          {columnWorkflowBinding &&
-            (workflowRuns ?? []).length > 0 &&
-            (() => {
-              const latestRun = (workflowRuns ?? [])[0];
-              const dur = latestRun.durationSeconds;
-              return (
-                <Box style={{ marginBottom: 20 }}>
-                  {/* sec-label */}
-                  <Box
-                    style={{
-                      fontSize: 12,
-                      fontWeight: 600,
-                      letterSpacing: '0.04em',
-                      textTransform: 'uppercase',
-                      color: 'var(--mantine-color-dimmed)',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 8,
-                      paddingBottom: 10,
-                      borderBottom: '1px solid var(--app-border-default)',
-                      marginBottom: 14,
-                    }}
-                  >
-                    <IconBolt size={14} color="var(--app-primary-strong)" />
-                    Latest run
-                  </Box>
-                  {/* run-summary card */}
-                  <Box
-                    style={{
-                      display: 'flex',
-                      gap: 16,
-                      alignItems: 'center',
-                      padding: '12px 14px',
-                      border: '1px solid var(--app-border-default)',
-                      borderRadius: 8,
-                      background: 'var(--app-bg-paper)',
-                    }}
-                  >
-                    <Box style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                      <Text
-                        style={{
-                          fontSize: 10,
-                          letterSpacing: '0.06em',
-                          textTransform: 'uppercase',
-                          color: 'var(--mantine-color-placeholder)',
-                        }}
-                      >
-                        Status
-                      </Text>
-                      <NeutralStatusChip state={latestRun.state} />
-                    </Box>
-                    {dur != null && (
-                      <Box style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                        <Text
-                          style={{
-                            fontSize: 10,
-                            letterSpacing: '0.06em',
-                            textTransform: 'uppercase',
-                            color: 'var(--mantine-color-placeholder)',
-                          }}
-                        >
-                          Duration
-                        </Text>
-                        <Text style={{ fontFamily: 'monospace', fontSize: 14, color: 'var(--mantine-color-text)' }}>
-                          {formatDuration(dur)}
-                        </Text>
-                      </Box>
-                    )}
-                    {latestRun.totalCostCents != null && (
-                      <Box style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                        <Text
-                          style={{
-                            fontSize: 10,
-                            letterSpacing: '0.06em',
-                            textTransform: 'uppercase',
-                            color: 'var(--mantine-color-placeholder)',
-                          }}
-                        >
-                          Cost
-                        </Text>
-                        <Text style={{ fontFamily: 'monospace', fontSize: 14, color: 'var(--mantine-color-text)' }}>
-                          {formatCostCents(latestRun.totalCostCents)}
-                        </Text>
-                      </Box>
-                    )}
-                    <Box
-                      component="button"
-                      onClick={() => setTab('runs')}
-                      style={{
-                        marginLeft: 'auto',
-                        background: 'none',
-                        border: 'none',
-                        color: 'var(--app-primary-strong)',
-                        fontSize: 12,
-                        fontWeight: 600,
-                        cursor: 'pointer',
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: 4,
-                        padding: '4px 0',
-                      }}
-                    >
-                      View runs <IconArrowRight size={12} />
-                    </Box>
-                  </Box>
-                </Box>
-              );
-            })()}
+          {/* Latest run summary (AC-19) — whenever the task has runs, bound column or not */}
+          {hasRuns && (
+            <LatestRunTile run={(workflowRuns ?? [])[0]} projectId={projectId} onViewRuns={() => setTab('runs')} />
+          )}
 
           {/* Properties */}
           <Box style={{ marginBottom: 20 }}>
@@ -2169,6 +2382,7 @@ function TaskDetailSidebar({
                 tags={task.tags ?? []}
                 onChange={(tags) => saveField('tags', tags)}
                 disabled={!canExecute}
+                suggestions={knownTags}
               />
 
               <Text size="xs" c="dimmed">
@@ -2197,7 +2411,7 @@ function TaskDetailSidebar({
                   {childTasks.map((child) => (
                     <UnstyledButton
                       key={child.id}
-                      onClick={() => onOpenTask(child)}
+                      onClick={() => onOpenTaskId(child.id)}
                       px={6}
                       py={4}
                       style={{
@@ -2238,8 +2452,8 @@ function TaskDetailSidebar({
               <Text size="xs" c="dimmed" fw={600} tt="uppercase" mb={4}>
                 Parent Epic
               </Text>
-              {parentTask ? (
-                <UnstyledButton onClick={() => onOpenTask(parentTask)}>
+              {parentLinkId ? (
+                <UnstyledButton onClick={() => onOpenTaskId(parentLinkId)}>
                   <Text
                     size="sm"
                     c="brand"
@@ -2251,7 +2465,7 @@ function TaskDetailSidebar({
                       e.currentTarget.style.textDecoration = 'none';
                     }}
                   >
-                    {parentTask.title}
+                    {parentTaskTitle}
                   </Text>
                 </UnstyledButton>
               ) : (
@@ -2262,239 +2476,103 @@ function TaskDetailSidebar({
             </Box>
           )}
 
-          {/* Pending waits */}
-          {(task.pendingGates ?? []).length > 0 && (
+          {/* CI gates — pending, passed, failed and stale. A stale gate is the case this panel exists
+              for: its webhook never arrived, reconciliation could not get a verdict either, and it is
+              now waiting on a person rather than on CI. */}
+          {gatesForPanel.length > 0 && (
             <Box>
               <Group gap={6} mb={4}>
-                <ThemeIcon size={18} variant="light" color="yellow" radius="xl">
-                  <IconHourglass size={12} />
+                <ThemeIcon size={18} variant="light" color={hasStaleGate ? 'orange' : 'yellow'} radius="xl">
+                  {hasStaleGate ? <IconAlertCircle size={12} /> : <IconHourglass size={12} />}
                 </ThemeIcon>
                 <Text size="xs" c="dimmed" fw={600} tt="uppercase">
-                  Pending Waits ({(task.pendingGates ?? []).length})
+                  CI Gates ({gatesForPanel.length})
                 </Text>
               </Group>
               <Stack gap={4}>
-                {(task.pendingGates ?? []).map((wait) => (
-                  <Group key={wait.id} gap="xs" align="flex-start" wrap="nowrap">
-                    <Badge
-                      size="xs"
-                      color="yellow"
-                      variant="filled"
-                      style={{ fontSize: 10, fontWeight: 600, flexShrink: 0 }}
-                    >
-                      {wait.gateType.replace(/_/g, ' ')}
-                    </Badge>
-                    <Box style={{ flex: 1, minWidth: 0 }}>
-                      {wait.gateType === 'github_checks_completed' &&
-                        wait.metadata.repoFullName &&
-                        wait.metadata.prNumber && (
-                          <Text
-                            component="a"
-                            href={`https://github.com/${wait.metadata.repoFullName}/pull/${wait.metadata.prNumber}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            size="xs"
-                            c="brand"
-                            style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                {gatesForPanel.map((wait) => {
+                  const kind = gateCiStatus(wait);
+                  const link = gateLink(wait);
+                  const detail = gateDetail(wait);
+
+                  return (
+                    // One line per gate, stale ones included: why reconciliation gave up is prose,
+                    // so it lives in the chip's tooltip rather than as a second line under the row.
+                    <Group key={wait.id} gap={8} align="center" wrap="nowrap">
+                      {/* A floor, not a fixed width: every state word fits inside it so the links
+                          still align, but a chip that ever outgrew it would widen the column
+                          rather than have its label clipped by the badge's ellipsis. */}
+                      <Box miw={GATE_CHIP_WIDTH} style={{ flexShrink: 0 }}>
+                        <GateStatusChip status={kind} tooltip={gateTooltip(wait)} />
+                      </Box>
+                      {link ? (
+                        <Text
+                          component="a"
+                          href={link.href}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          size="xs"
+                          c="brand"
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 4,
+                            flex: 1,
+                            minWidth: 0,
+                            textDecoration: 'none',
+                          }}
+                        >
+                          <IconLink size={10} style={{ flexShrink: 0 }} />
+                          <Box
+                            component="span"
+                            style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
                           >
-                            <IconLink size={10} />
-                            {String(wait.metadata.repoFullName)} #{String(wait.metadata.prNumber)}
-                          </Text>
-                        )}
-                      {wait.gateType === 'github_workflow_completed' &&
-                        wait.metadata.repoFullName &&
-                        wait.metadata.runId && (
-                          <Text
-                            component="a"
-                            href={`https://github.com/${wait.metadata.repoFullName}/actions/runs/${wait.metadata.runId}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            size="xs"
-                            c="brand"
-                            style={{ display: 'flex', alignItems: 'center', gap: 4 }}
-                          >
-                            <IconLink size={10} />
-                            {String(wait.metadata.repoFullName)} #{String(wait.metadata.runId)}
-                          </Text>
-                        )}
-                    </Box>
-                    {canExecute && (
-                      <ActionIcon
-                        size="xs"
-                        variant="subtle"
-                        color="gray"
-                        onClick={() => handleDeleteGate(wait.id)}
-                        loading={deletingGateId === wait.id}
-                      >
-                        <IconX size={12} />
-                      </ActionIcon>
-                    )}
-                  </Group>
-                ))}
+                            {link.label}
+                          </Box>
+                        </Text>
+                      ) : (
+                        // A gate whose metadata carries no linkable reference still has to say what
+                        // it is waiting on, and the chip only carries the state.
+                        <Text size="xs" c="dimmed" style={{ flex: 1, minWidth: 0 }} lineClamp={1}>
+                          {wait.gateType.replace(/_/g, ' ')}
+                        </Text>
+                      )}
+                      {/* Age, TTL and an unusual conclusion — what the chip cannot say on its own:
+                          "waiting" reads very differently at two minutes and at eleven hours. */}
+                      {detail && (
+                        <Text size="xs" c="dimmed" style={{ fontSize: 11, flexShrink: 0 }}>
+                          {detail}
+                        </Text>
+                      )}
+                      {canExecute && GATE_UNRESOLVED_STATUSES.has(kind) && (
+                        <ActionIcon
+                          size="xs"
+                          variant="subtle"
+                          color="gray"
+                          aria-label={`Delete gate ${wait.id}`}
+                          onClick={() => handleDeleteGate(wait.id)}
+                          loading={deletingGateId === wait.id}
+                        >
+                          <IconX size={12} />
+                        </ActionIcon>
+                      )}
+                    </Group>
+                  );
+                })}
               </Stack>
             </Box>
           )}
         </Tabs.Panel>
 
-        {/* Runs tab — hidden for manual tasks (AC-22) */}
-        {columnWorkflowBinding && (
-          <Tabs.Panel value="runs" p="md" style={{ flex: 1, overflow: 'auto' }}>
-            <Stack gap="md">
-              {(workflowRuns ?? []).length === 0 ? (
-                <Text size="sm" c="dimmed" ta="center" py="xl">
-                  No runs yet.
-                </Text>
-              ) : (
-                <>
-                  {/* Totals row */}
-                  <Group gap="lg" wrap="wrap">
-                    <Box>
-                      <Text size="xs" c="dimmed" tt="uppercase" fw={600} mb={2}>
-                        Runs
-                      </Text>
-                      <Text size="sm" fw={600}>
-                        {(workflowRuns ?? []).length}
-                      </Text>
-                    </Box>
-                    <Box>
-                      <Text size="xs" c="dimmed" tt="uppercase" fw={600} mb={2}>
-                        Success rate
-                      </Text>
-                      <Text size="sm" fw={600}>
-                        {Math.round(
-                          ((workflowRuns ?? []).filter((r) => r.state === 'completed' || r.state === 'succeeded')
-                            .length /
-                            (workflowRuns ?? []).length) *
-                            100,
-                        )}
-                        %
-                      </Text>
-                    </Box>
-                    {(workflowRuns ?? []).some((r) => r.totalCostCents != null) && (
-                      <Box>
-                        <Text size="xs" c="dimmed" tt="uppercase" fw={600} mb={2}>
-                          Total cost
-                        </Text>
-                        <Text size="sm" ff="monospace" fw={600}>
-                          {formatCostCents((workflowRuns ?? []).reduce((s, r) => s + (r.totalCostCents ?? 0), 0))}
-                        </Text>
-                      </Box>
-                    )}
-                  </Group>
-
-                  {/* Run history */}
-                  <Stack gap={4}>
-                    {(workflowRuns ?? []).map((run) => (
-                      <Box
-                        key={run.id}
-                        p="xs"
-                        style={{ border: '1px solid var(--app-border-default)', borderRadius: 8 }}
-                      >
-                        <Group justify="space-between" wrap="nowrap" gap="xs">
-                          <NeutralStatusChip state={run.state} />
-                          <Text
-                            component="a"
-                            href={`/company/projects/${projectId}/workflow_runs/${run.id}`}
-                            target="_blank"
-                            rel="noopener"
-                            size="xs"
-                            c="brand"
-                            style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 4,
-                              flex: 1,
-                              minWidth: 0,
-                              textDecoration: 'none',
-                            }}
-                          >
-                            <Box
-                              component="span"
-                              style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                            >
-                              {run.workflowName ?? 'Workflow run'}
-                            </Box>
-                            <IconExternalLink size={11} style={{ flexShrink: 0 }} />
-                          </Text>
-                          <Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-                            {formatDateTime(run.createdAt)}
-                          </Text>
-                        </Group>
-
-                        {/* Step timeline for first (latest) run */}
-                        {run.id === (workflowRuns ?? [])[0]?.id && (run.steps ?? []).length > 0 && (
-                          <Box mt="xs">
-                            {(run.steps ?? []).map((step, i) => {
-                              const isHidden = !showAllSteps && i > 2;
-                              return (
-                                <Box
-                                  key={i}
-                                  style={{
-                                    display: isHidden ? 'none' : 'flex',
-                                    gap: 10,
-                                    paddingTop: 8,
-                                    paddingBottom: 8,
-                                    borderBottom: '1px solid var(--app-border-default)',
-                                  }}
-                                >
-                                  <Box
-                                    w={8}
-                                    h={8}
-                                    mt={4}
-                                    style={{
-                                      borderRadius: '50%',
-                                      flexShrink: 0,
-                                      backgroundColor:
-                                        step.state === 'done'
-                                          ? 'var(--app-success-fg)'
-                                          : step.state === 'running'
-                                            ? 'var(--app-warning-fg)'
-                                            : step.state === 'failed'
-                                              ? 'var(--app-danger-fg)'
-                                              : 'var(--mantine-color-gray-5)',
-                                    }}
-                                  />
-                                  <Box style={{ flex: 1 }}>
-                                    <Text size="sm" c={step.state === 'waiting' ? 'dimmed' : undefined}>
-                                      {step.name}
-                                    </Text>
-                                    <Text size="xs" c="dimmed" ff="monospace">
-                                      {step.durationSeconds != null ? formatDuration(step.durationSeconds) : '—'}
-                                    </Text>
-                                  </Box>
-                                </Box>
-                              );
-                            })}
-                            {(run.steps ?? []).length > 3 && (
-                              <Button variant="subtle" size="xs" mt={8} onClick={() => setShowAllSteps((s) => !s)}>
-                                {showAllSteps ? 'Show fewer steps' : `Show all ${(run.steps ?? []).length} steps`}
-                              </Button>
-                            )}
-                          </Box>
-                        )}
-
-                        {/* Retry in Runs tab for failed run (AC-56) */}
-                        {run.state === 'failed' && canExecute && (
-                          <Box mt="xs">
-                            <Button
-                              size="compact-xs"
-                              variant="outline"
-                              color="red"
-                              leftSection={<IconRefresh size={11} />}
-                              loading={triggeringWorkflow}
-                              onClick={handleTriggerWorkflow}
-                            >
-                              Retry run
-                            </Button>
-                          </Box>
-                        )}
-                      </Box>
-                    ))}
-                  </Stack>
-                </>
-              )}
-            </Stack>
-          </Tabs.Panel>
+        {/* Runs tab — hidden only for manual tasks that never ran (AC-22) */}
+        {showRuns && (
+          <TaskRunsPanel
+            runs={workflowRuns ?? []}
+            projectId={projectId}
+            canRetry={canExecute && !!columnWorkflowBinding}
+            retrying={triggeringWorkflow}
+            onRetry={handleTriggerWorkflow}
+          />
         )}
 
         {/* Comments — composer on top, filter row below (AC-24) */}
@@ -3191,7 +3269,8 @@ function TaskDetailSidebar({
                     </Text>
                     <Text size="11px" c="dimmed">
                       {stats.gateStats.filter((w) => w.status === 'pending').length} pending &middot;{' '}
-                      {stats.gateStats.filter((w) => w.status === 'resolved').length} resolved
+                      {stats.gateStats.filter((w) => w.status === 'resolved').length} resolved &middot;{' '}
+                      {stats.gateStats.filter((w) => w.status === 'stale').length} stale
                     </Text>
                   </Group>
                   <Paper p="md" radius="md" withBorder>
@@ -3210,6 +3289,12 @@ function TaskDetailSidebar({
                         >
                           {w.status === 'resolved' ? (
                             <IconCircleCheck size={14} color="var(--mantine-color-green-6)" style={{ flexShrink: 0 }} />
+                          ) : w.status === 'stale' ? (
+                            <IconAlertCircle
+                              size={14}
+                              color="var(--mantine-color-orange-6)"
+                              style={{ flexShrink: 0 }}
+                            />
                           ) : (
                             <IconHourglass size={14} color="var(--mantine-color-yellow-6)" style={{ flexShrink: 0 }} />
                           )}
@@ -3226,7 +3311,7 @@ function TaskDetailSidebar({
                           <Badge
                             size="xs"
                             variant="filled"
-                            color={w.status === 'resolved' ? 'green' : 'yellow'}
+                            color={w.status === 'resolved' ? 'green' : w.status === 'stale' ? 'orange' : 'yellow'}
                             style={{ fontSize: 10, fontWeight: 600 }}
                           >
                             {w.status}
@@ -3726,6 +3811,107 @@ function BoardPresetPicker({ projectId, presets }: { projectId: number; presets:
   );
 }
 
+// --- Tag filter ---
+
+// A board accumulates tags without bound, so the filter is a searchable combobox rather than a
+// plain menu: type to narrow, arrows + Enter to pick, and the option list scrolls instead of
+// growing past the viewport — every tag stays reachable no matter how many there are.
+function TagFilterCombobox({
+  allTags,
+  selected,
+  onToggle,
+  onClear,
+}: {
+  allTags: string[];
+  selected: string[];
+  onToggle: (tag: string) => void;
+  onClear: () => void;
+}) {
+  const [search, setSearch] = useState('');
+  const combobox = useCombobox({
+    onDropdownClose: () => {
+      combobox.resetSelectedOption();
+      setSearch('');
+    },
+    // Focus the search box on open so typing filters immediately, without a second click.
+    onDropdownOpen: () => combobox.focusSearchInput(),
+  });
+
+  const matches = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return query ? allTags.filter((tag) => tag.toLowerCase().includes(query)) : allTags;
+  }, [allTags, search]);
+
+  const label = selected.length === 0 ? 'All' : selected.length === 1 ? selected[0] : `${selected.length} selected`;
+
+  return (
+    <Combobox
+      store={combobox}
+      width={240}
+      position="bottom-start"
+      shadow="md"
+      withinPortal
+      // Tags filter as a set, so submitting an option toggles it and leaves the dropdown open —
+      // several tags can be picked in one pass.
+      onOptionSubmit={(tag) => onToggle(tag)}
+    >
+      <Combobox.Target targetType="button">
+        <Button
+          variant="default"
+          size="xs"
+          leftSection={<IconTag size={12} />}
+          onClick={() => combobox.toggleDropdown()}
+          styles={{
+            root: {
+              fontWeight: 400,
+              color: selected.length > 0 ? 'var(--mantine-color-text)' : 'var(--mantine-color-dimmed)',
+            },
+          }}
+        >
+          Tags: {label}
+        </Button>
+      </Combobox.Target>
+
+      <Combobox.Dropdown>
+        <Combobox.Search
+          value={search}
+          onChange={(e) => setSearch(e.currentTarget.value)}
+          placeholder="Search tags"
+          aria-label="Search tags"
+        />
+        <Combobox.Options>
+          <ScrollArea.Autosize mah={240} type="scroll">
+            {matches.length === 0 ? (
+              <Combobox.Empty>No tags found</Combobox.Empty>
+            ) : (
+              matches.map((tag) => {
+                const isSelected = selected.includes(tag);
+                return (
+                  <Combobox.Option value={tag} key={tag} active={isSelected}>
+                    <Group gap={6} wrap="nowrap">
+                      <IconCheck size={12} style={{ flexShrink: 0, visibility: isSelected ? 'visible' : 'hidden' }} />
+                      <Text size="xs" fw={isSelected ? 600 : 400} style={{ wordBreak: 'break-word' }}>
+                        {tag}
+                      </Text>
+                    </Group>
+                  </Combobox.Option>
+                );
+              })
+            )}
+          </ScrollArea.Autosize>
+        </Combobox.Options>
+        {selected.length > 0 && (
+          <Combobox.Footer>
+            <Button variant="subtle" color="gray" size="compact-xs" onClick={onClear}>
+              Clear tags
+            </Button>
+          </Combobox.Footer>
+        )}
+      </Combobox.Dropdown>
+    </Combobox>
+  );
+}
+
 // --- View Preset Menu ---
 
 function ViewPresetMenu({
@@ -3951,6 +4137,7 @@ function normalizeTask(t: Task): Task {
     tags: t.tags ?? [],
     archived: t.archived ?? false,
     pendingGates: t.pendingGates ?? [],
+    ciGates: t.ciGates ?? [],
     recentWorkflowRuns: t.recentWorkflowRuns ?? [],
     assetsCount: t.assetsCount ?? 0,
     childrenCount: t.childrenCount ?? 0,
@@ -3958,13 +4145,18 @@ function normalizeTask(t: Task): Task {
   };
 }
 
-// Merge two task lists, deduping by id. Tasks in `primary` win over `extra`
-// (used to fold on-demand-loaded archived tasks into the active board without
-// duplicating any task that already appears in the active set).
-function mergeTasksById(primary: Task[], extra: Task[]): Task[] {
-  const ids = new Set(primary.map((t) => t.id));
-  return [...primary, ...extra.filter((t) => !ids.has(t.id))];
-}
+// Mirrors BoardTask::PAGE_SIZE. Only used when the prop is missing (a partial reload of a page
+// rendered before the prop existed) — the server's value wins.
+const DEFAULT_TASKS_PAGE_SIZE = 25;
+
+// Stable fallbacks: useBoardTaskPages keys its work off array identity, so a fresh `[]` per render
+// would have it re-derive its state on every render for nothing.
+const NO_TASKS: Task[] = [];
+const NO_COLUMNS: Column[] = [];
+const NO_EPICS: Array<{ id: number; title: string }> = [];
+
+// How close to the bottom of a column the scroll has to get before its next page is fetched.
+const LOAD_MORE_SCROLL_THRESHOLD_PX = 200;
 
 const BoardPage = () => {
   const {
@@ -3973,6 +4165,9 @@ const BoardPage = () => {
     boardPresets,
     columns,
     tasks: serverTasks,
+    tasksPageSize,
+    boardTags,
+    epics,
     members,
     viewPresets,
     currentUserId,
@@ -3989,45 +4184,35 @@ const BoardPage = () => {
   const { canExecute } = useProjectPermissions();
 
   const [filters, setFilters] = useState<BoardFilters>(EMPTY_FILTERS);
-  const showArchived = filters.showArchived;
 
-  // Archived tasks are fetched on demand — only when "Show archived" is enabled — so the
-  // initial board load stays limited to active tasks (the core load optimization). Refetched
-  // whenever the active task set changes so archive/unarchive stays reflected in this view.
-  const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
+  // Typing must not fire a request per keystroke now that search runs server-side.
+  const [debouncedSearch] = useDebouncedValue(filters.search, 300);
+  const serverFilters = useMemo(() => ({ ...filters, search: debouncedSearch }), [filters, debouncedSearch]);
 
-  const [localTasks, setLocalTasks] = useState<Task[]>(() => (serverTasks ?? []).map(normalizeTask));
-  useEffect(() => {
-    const base = (serverTasks ?? []).map(normalizeTask);
-    setLocalTasks(showArchived ? mergeTasksById(base, archivedTasks) : base);
-  }, [serverTasks, archivedTasks, showArchived]);
+  // Columns load a page at a time: the props carry the first page of each, this hook fetches the
+  // rest as columns are scrolled, and re-queries the board server-side whenever a filter is on
+  // (including "Show archived", which is how archived tasks reach the board at all).
+  const {
+    tasks: localTasks,
+    setTasks: setLocalTasks,
+    counts: columnCounts,
+    hasMore: columnHasMore,
+    loading: columnLoading,
+    loadMore: loadMoreColumn,
+  } = useBoardTaskPages<Task>({
+    projectId: project.id,
+    enabled: !!board,
+    columns: columns ?? NO_COLUMNS,
+    initialTasks: serverTasks ?? NO_TASKS,
+    pageSize: tasksPageSize ?? DEFAULT_TASKS_PAGE_SIZE,
+    filters: serverFilters,
+    normalize: normalizeTask,
+  });
 
   const [localColumns, setLocalColumns] = useState<Column[]>(() => columns ?? []);
   useEffect(() => {
     setLocalColumns(columns ?? []);
   }, [columns]);
-
-  useEffect(() => {
-    if (!showArchived || !board) {
-      if (!showArchived) setArchivedTasks([]);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await apiFetch(`${apiV1ProjectTasksPath(project.id)}?archived=archived`);
-        if (res.ok && !cancelled) {
-          const data = await res.json();
-          setArchivedTasks((Array.isArray(data) ? data : []).map(normalizeTask));
-        }
-      } catch {
-        /* ignore */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [showArchived, board, project.id, serverTasks]);
 
   const selectedTask = selectedTaskProp ? normalizeTask(selectedTaskProp) : null;
 
@@ -4041,7 +4226,7 @@ const BoardPage = () => {
     const nextTask = normalizeTask(selectedTaskProp);
 
     setLocalTasks((prev) => prev.map((t) => (t.id === nextTask.id ? nextTask : t)));
-  }, [selectedTaskProp]);
+  }, [selectedTaskProp, setLocalTasks]);
 
   const boardUrl = `/company/projects/${project.id}/board`;
 
@@ -4057,13 +4242,20 @@ const BoardPage = () => {
 
   const [createOpen, setCreateOpen] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
-  const [activeTask, setActiveTask] = useState<Task | null>(null);
-  const [hoverColumnId, setHoverColumnId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const collapsedColumnsStorageKey = board ? `board:${board.id}:collapsedColumns` : null;
   const [collapsedColumns, setCollapsedColumns] = useLocalStorageSet<number>(collapsedColumnsStorageKey, new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Opening by id, for a task the board may not hold a card for — an epic's child or parent that
+  // lives on a page no column has loaded.
+  const openTaskById = useCallback(
+    (taskId: number) => {
+      router.get(boardUrl, { task: taskId }, { preserveState: true, preserveScroll: true });
+    },
+    [boardUrl],
+  );
 
   const openTask = useCallback(
     (task: Task | null) => {
@@ -4102,33 +4294,31 @@ const BoardPage = () => {
     filters.search
   );
 
-  const allTags = useMemo(() => {
-    const tagSet = new Set<string>();
-    for (const t of localTasks) for (const tag of t.tags ?? []) tagSet.add(tag);
-    return [...tagSet].sort();
-  }, [localTasks]);
+  // Every tag on the board, not only the tags of the loaded pages — otherwise a filter could not
+  // reach a tag that only exists further down a column.
+  const allTags = useMemo(() => [...(boardTags ?? [])].sort(), [boardTags]);
 
-  const filteredTasks = useMemo(() => {
-    return localTasks.filter((t) => {
-      if (!filters.showArchived && t.archived) return false;
-      if (filters.search && !(t.title ?? '').toLowerCase().includes(filters.search.toLowerCase())) return false;
-      if (filters.assigneeId && String(t.assigneeId) !== filters.assigneeId) return false;
-      if (filters.taskType && t.taskType !== filters.taskType) return false;
-      if (filters.priority && t.priority !== filters.priority) return false;
-      if (filters.tags.length > 0 && !filters.tags.every((ft) => (t.tags ?? []).includes(ft))) return false;
-      return true;
-    });
-  }, [localTasks, filters]);
+  // Shared by the toolbar combobox and the tag chips on cards, so both paths add and remove the
+  // same filter entry — clicking a tag twice (anywhere) clears it.
+  const toggleTagFilter = useCallback((tag: string) => {
+    setFilters((f) => ({
+      ...f,
+      tags: f.tags.includes(tag) ? f.tags.filter((t) => t !== tag) : [...f.tags, tag],
+    }));
+  }, []);
 
+  const clearTagFilter = useCallback(() => setFilters((f) => ({ ...f, tags: [] })), []);
+
+  // Filtering itself is server-side (see useBoardTaskPages); the loaded tasks only need bucketing.
   const tasksByColumn = useMemo(() => {
     const map: Record<number, Task[]> = {};
     for (const col of columns) map[col.id] = [];
-    for (const task of filteredTasks) {
+    for (const task of localTasks) {
       if (map[task.boardColumnId]) map[task.boardColumnId].push(task);
     }
     for (const col of columns) map[col.id].sort((a, b) => a.position - b.position);
     return map;
-  }, [columns, filteredTasks]);
+  }, [columns, localTasks]);
 
   const form = useForm<TaskFormValues>({
     validate: zodResolver(taskSchema),
@@ -4144,11 +4334,9 @@ const BoardPage = () => {
   });
 
   // Epics available as a parent in the create drawer. Nesting is one level deep, so an epic
-  // itself never gets a parent — the field is hidden when Type is Epic (see below).
-  const epicOptions = useMemo(
-    () => localTasks.filter((t) => t.taskType === 'epic').map((t) => ({ value: String(t.id), label: t.title })),
-    [localTasks],
-  );
+  // itself never gets a parent — the field is hidden when Type is Epic (see below). The list comes
+  // from the board rather than the loaded tasks, which hold only a page per column.
+  const epicOptions = useMemo(() => (epics ?? []).map((e) => ({ value: String(e.id), label: e.title })), [epics]);
 
   const handleCreateTask = useCallback(
     async (values: TaskFormValues) => {
@@ -4183,7 +4371,7 @@ const BoardPage = () => {
       }
       setLoading(false);
     },
-    [board, project.id, form],
+    [board, project.id, form, setLocalTasks],
   );
 
   const handleDeleteTask = useCallback(
@@ -4198,172 +4386,16 @@ const BoardPage = () => {
     [project.id, closeTask],
   );
 
-  const preDragSnapshotRef = useRef<Task[]>([]);
-  const draggedIdRef = useRef<number | null>(null);
-  const dragTypeRef = useRef<'task' | 'column' | null>(null);
-
-  const handleDragStart = useCallback(
-    (event: DragStartEvent) => {
-      const data = event.active.data.current;
-      if (data?.type === 'column') {
-        dragTypeRef.current = 'column';
-        setActiveTask(null);
-      } else {
-        dragTypeRef.current = 'task';
-        const taskData = data?.task as Task | undefined;
-        setActiveTask(taskData ?? null);
-        draggedIdRef.current = taskData?.id ?? null;
-        preDragSnapshotRef.current = localTasks.map((t) => ({ ...t }));
-      }
-      setHoverColumnId(null);
-    },
-    [], // no dependencies needed; only reads refs and sets state
-  );
-
-  const handleDragOver = useCallback((event: DragOverEvent) => {
-    if (dragTypeRef.current === 'column') return; // columns handled in dragEnd only
-
-    const { over } = event;
-    if (!over) {
-      setHoverColumnId(null);
-      return;
-    }
-
-    let targetColumnId: number | null = null;
-    if (over.data.current?.columnId) {
-      targetColumnId = over.data.current.columnId as number;
-    } else if (over.data.current?.task) {
-      const overTask = over.data.current.task as Task;
-      targetColumnId = overTask.boardColumnId;
-    }
-
-    setHoverColumnId(targetColumnId);
-
-    if (targetColumnId == null) return;
-    const activeId = draggedIdRef.current;
-    if (activeId == null) return;
-
-    setLocalTasks((prev) => {
-      const activeItem = prev.find((t) => t.id === activeId);
-      if (!activeItem || activeItem.boardColumnId === targetColumnId) return prev;
-
-      const targetTasks = prev.filter((t) => t.boardColumnId === targetColumnId);
-      const maxPos = targetTasks.reduce((max, t) => Math.max(max, t.position), -1);
-
-      return prev.map((t) => (t.id === activeId ? { ...t, boardColumnId: targetColumnId!, position: maxPos + 1 } : t));
-    });
-  }, []);
-
-  const handleDragEnd = useCallback(
-    async (event: DragEndEvent) => {
-      setActiveTask(null);
-      setHoverColumnId(null);
-      const { active, over } = event;
-
-      // ── Column reorder ──────────────────────────────────────────────────────
-      if (dragTypeRef.current === 'column') {
-        dragTypeRef.current = null;
-        if (!over || active.id === over.id) return;
-
-        const oldIdx = localColumns.findIndex((c) => `col-${c.id}` === active.id);
-        const newIdx = localColumns.findIndex((c) => `col-${c.id}` === over.id);
-        if (oldIdx === -1 || newIdx === -1) return;
-
-        const newOrder = arrayMove(localColumns, oldIdx, newIdx);
-        setLocalColumns(newOrder);
-
-        // persist to server with error recovery
-        apiFetch(reorderApiV1ProjectColumnsPath(project.id), {
-          method: 'PATCH',
-          headers: jsonHeaders,
-          body: JSON.stringify({ columnIds: newOrder.map((c) => c.id) }),
-        })
-          .then(() => router.reload({ only: ['columns'] }))
-          .catch(() => {
-            setLocalColumns(localColumns); // revert on error
-            // Error toast would be shown by global error handler
-          });
-        return;
-      }
-
-      // ── Task move ──────────────────────────────────────────────────────────
-      dragTypeRef.current = null;
-      if (!over || !board) {
-        draggedIdRef.current = null;
-        return;
-      }
-
-      const origTask = preDragSnapshotRef.current.find((t) => t.id === draggedIdRef.current);
-      draggedIdRef.current = null;
-      if (!origTask) return;
-
-      let targetColumnId: number;
-      let targetPosition: number | undefined;
-
-      if (over.data.current?.task) {
-        const overTask = over.data.current.task as Task;
-        targetColumnId = overTask.boardColumnId;
-        targetPosition = overTask.position;
-      } else if (over.data.current?.columnId) {
-        targetColumnId = over.data.current.columnId as number;
-      } else {
-        return;
-      }
-
-      const sameColumn = targetColumnId === origTask.boardColumnId;
-      if (sameColumn && targetPosition === undefined) return;
-      if (sameColumn && targetPosition === origTask.position) return;
-
-      const snapshot = preDragSnapshotRef.current;
-      const maxInTargetColumn = snapshot
-        .filter((t) => t.boardColumnId === targetColumnId && t.id !== origTask.id)
-        .reduce((max, t) => Math.max(max, t.position), 0);
-      const position = targetPosition ?? maxInTargetColumn + 1;
-
-      setLocalTasks((prev) => {
-        const next = prev.map((t) => ({ ...t }));
-        const dragged = next.find((t) => t.id === origTask.id);
-        if (!dragged) return prev;
-
-        for (const t of next) {
-          if (t.id === origTask.id) continue;
-          if (t.boardColumnId === targetColumnId) {
-            if (t.position >= position) t.position += 1;
-          }
-        }
-        dragged.boardColumnId = targetColumnId;
-        dragged.position = position;
-
-        const colTasks = next.filter((t) => t.boardColumnId === targetColumnId).sort((a, b) => a.position - b.position);
-        colTasks.forEach((t, i) => {
-          t.position = i;
-        });
-
-        if (!sameColumn) {
-          const oldColTasks = next
-            .filter((t) => t.boardColumnId === origTask.boardColumnId)
-            .sort((a, b) => a.position - b.position);
-          oldColTasks.forEach((t, i) => {
-            t.position = i;
-          });
-        }
-
-        return next;
-      });
-
-      try {
-        await apiFetch(moveApiV1ProjectTaskPath(project.id, origTask.id), {
-          method: 'PATCH',
-          headers: jsonHeaders,
-          body: JSON.stringify({ columnId: targetColumnId, position }),
-        });
-        // cable confirms via board.touch → broadcast_refresh_to(board) → only: ['tasks', 'columns', 'recent_activities']
-      } catch {
-        setLocalTasks(preDragSnapshotRef.current);
-      }
-    },
-    [board, project.id, localColumns],
-  );
+  // Drag-and-drop (task moves + column reorder) lives in useBoardDnd so its behaviour is
+  // testable without element geometry, which jsdom cannot provide for dnd-kit's sensors.
+  const { activeTask, hoverColumnId, handleDragStart, handleDragOver, handleDragEnd } = useBoardDnd({
+    projectId: project.id,
+    enabled: !!board,
+    tasks: localTasks,
+    setTasks: setLocalTasks,
+    columns: localColumns,
+    setColumns: setLocalColumns,
+  });
 
   const openCreateForColumn = (columnId: number) => {
     form.setFieldValue('boardColumnId', String(columnId));
@@ -4625,53 +4657,12 @@ const BoardPage = () => {
 
           {/* Tags — only when there are tags */}
           {allTags.length > 0 && (
-            <Menu shadow="md" width={200} position="bottom-start" closeOnItemClick={false}>
-              <Menu.Target>
-                <Button
-                  variant="default"
-                  size="xs"
-                  leftSection={<IconTag size={12} />}
-                  styles={{
-                    root: {
-                      fontWeight: 400,
-                      color: filters.tags.length > 0 ? 'var(--mantine-color-text)' : 'var(--mantine-color-dimmed)',
-                    },
-                  }}
-                >
-                  Tags:{' '}
-                  {filters.tags.length === 0
-                    ? 'All'
-                    : filters.tags.length === 1
-                      ? filters.tags[0]
-                      : `${filters.tags.length} selected`}
-                </Button>
-              </Menu.Target>
-              <Menu.Dropdown>
-                {allTags.map((tag) => (
-                  <Menu.Item
-                    key={tag}
-                    onClick={() =>
-                      setFilters((f) => ({
-                        ...f,
-                        tags: f.tags.includes(tag) ? f.tags.filter((t) => t !== tag) : [...f.tags, tag],
-                      }))
-                    }
-                    rightSection={filters.tags.includes(tag) ? <IconCheck size={12} /> : null}
-                    fw={filters.tags.includes(tag) ? 600 : 400}
-                  >
-                    {tag}
-                  </Menu.Item>
-                ))}
-                {filters.tags.length > 0 && (
-                  <>
-                    <Menu.Divider />
-                    <Menu.Item color="gray" onClick={() => setFilters((f) => ({ ...f, tags: [] }))}>
-                      Clear tags
-                    </Menu.Item>
-                  </>
-                )}
-              </Menu.Dropdown>
-            </Menu>
+            <TagFilterCombobox
+              allTags={allTags}
+              selected={filters.tags}
+              onToggle={toggleTagFilter}
+              onClear={clearTagFilter}
+            />
           )}
 
           {/* Show archived toggle */}
@@ -4722,6 +4713,15 @@ const BoardPage = () => {
           >
             Activity
           </Button>
+
+          {/* Board settings — the only entry point to BoardSettingsDialog */}
+          {canExecute && (
+            <Tooltip label="Board settings">
+              <ActionIcon variant="subtle" size="sm" aria-label="Board settings" onClick={() => setSettingsOpen(true)}>
+                <IconSettings size={16} />
+              </ActionIcon>
+            </Tooltip>
+          )}
         </Group>
 
         {/* Board area */}
@@ -4743,10 +4743,16 @@ const BoardPage = () => {
                   key={col.id}
                   column={col}
                   tasks={tasksByColumn[col.id] ?? []}
+                  totalCount={columnCounts[col.id] ?? (tasksByColumn[col.id] ?? []).length}
+                  hasMore={columnHasMore[col.id] ?? false}
+                  loadingMore={columnLoading[col.id] ?? false}
+                  onLoadMore={loadMoreColumn}
                   taskHref={taskHref}
                   onAddTask={openCreateForColumn}
                   onTaskClick={openTask}
                   onRetryTask={handleRetryTask}
+                  onTagClick={toggleTagFilter}
+                  activeTags={filters.tags}
                   collapsed={collapsedColumns.has(col.id)}
                   onToggleCollapse={handleToggleCollapse}
                   onMoveLeft={
@@ -4786,60 +4792,61 @@ const BoardPage = () => {
               ))}
             </SortableContext>
 
-            {/* Add column button — strip when all columns are collapsed, pill otherwise */}
-            {(() => {
-              const allCollapsed = allColumnsCollapsed;
-              return allCollapsed ? (
-                <Box
-                  onClick={handleAddColumnInline}
-                  className={styles.addColumnBtn}
+            {/* Add column button — vertical strip once the board has columns, pill on an empty board */}
+            {localColumns.length > 0 ? (
+              <Box
+                onClick={handleAddColumnInline}
+                className={styles.addColumnBtn}
+                data-testid="add-column-control"
+                data-orientation="vertical"
+                style={{
+                  flex: '0 0 46px',
+                  minWidth: 46,
+                  maxWidth: 46,
+                  alignSelf: 'stretch',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'flex-start',
+                  gap: 10,
+                  padding: '12px 0',
+                }}
+              >
+                <IconPlus size={15} />
+                <div
                   style={{
-                    flex: '0 0 46px',
-                    minWidth: 46,
-                    maxWidth: 46,
-                    alignSelf: 'stretch',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: 'center',
-                    justifyContent: 'flex-start',
-                    gap: 10,
-                    padding: '12px 0',
-                  }}
-                >
-                  <IconPlus size={15} />
-                  <div
-                    style={{
-                      writingMode: 'vertical-rl',
-                      fontSize: 13,
-                      fontWeight: 500,
-                      userSelect: 'none',
-                    }}
-                  >
-                    Add column
-                  </div>
-                </Box>
-              ) : (
-                <Box
-                  onClick={handleAddColumnInline}
-                  className={styles.addColumnBtn}
-                  style={{
-                    flex: '0 0 220px',
-                    minWidth: 220,
-                    alignSelf: 'flex-start',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 6,
-                    height: 44,
+                    writingMode: 'vertical-rl',
                     fontSize: 13,
                     fontWeight: 500,
+                    userSelect: 'none',
                   }}
                 >
-                  <IconPlus size={15} />
                   Add column
-                </Box>
-              );
-            })()}
+                </div>
+              </Box>
+            ) : (
+              <Box
+                onClick={handleAddColumnInline}
+                className={styles.addColumnBtn}
+                data-testid="add-column-control"
+                data-orientation="horizontal"
+                style={{
+                  flex: '0 0 220px',
+                  minWidth: 220,
+                  alignSelf: 'flex-start',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 6,
+                  height: 44,
+                  fontSize: 13,
+                  fontWeight: 500,
+                }}
+              >
+                <IconPlus size={15} />
+                Add column
+              </Box>
+            )}
           </Box>
           <DragOverlay dropAnimation={{ duration: 200, easing: 'cubic-bezier(0.25, 1, 0.5, 1)' }}>
             {activeTask ? (
@@ -4861,9 +4868,11 @@ const BoardPage = () => {
       <TaskDetailSidebar
         task={selectedTask}
         allTasks={localTasks}
+        epics={epics ?? NO_EPICS}
+        knownTags={allTags}
         onClose={closeTask}
         onDelete={handleDeleteTask}
-        onOpenTask={openTask}
+        onOpenTaskId={openTaskById}
         projectId={project.id}
         columns={columns}
         members={members}

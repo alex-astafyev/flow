@@ -57,6 +57,7 @@ const AGENT_LABELS: Record<string, string> = {
   cursor_cli: 'Cursor CLI',
   codex: 'Codex',
   gemini_cli: 'Gemini CLI',
+  grok: 'Grok',
 };
 
 // ── Meta Activity Types ────────────────────────────
@@ -177,6 +178,8 @@ const SessionPage = () => {
   // ── Render: Terminal panel ─────────────────────
 
   const renderMainPanel = () => {
+    if (finishRequested || isFinishing) return null;
+
     if (!canShowTerminal) {
       return (
         <div className={classes.mainPanel}>

@@ -1,6 +1,11 @@
 # frozen_string_literal: true
 
 class Web::Company::Projects::BoardsController < Web::Company::Projects::ApplicationController
+  # Epics offered as a parent in the create-task drawer. Nesting is one level deep and
+  # boards run to a handful of epics, so the whole list ships; the cap only exists so a
+  # pathological board cannot unbound the payload this change just bounded.
+  EPIC_OPTIONS_LIMIT = 200
+
   def show
     board = current_project.board
 
@@ -19,20 +24,32 @@ class Web::Company::Projects::BoardsController < Web::Company::Projects::Applica
     render inertia: "Projects/Board/BoardPage", props: {
       board: -> { BoardResource.new(board).to_h },
       columns: -> {
-        board.board_columns.includes(column_workflow_binding: :workflow)
+        board.board_columns.with_tasks_count.includes(column_workflow_binding: :workflow)
              .order(:position).map { |c| BoardColumnResource.new(c).to_h }
       },
+      # Only the first page of each column. The column pulls its later pages from
+      # Api::V1::Projects::Board::TasksController as it is scrolled, so this payload
+      # stays the same size whether the board holds fifty tasks or five thousand.
       tasks: -> {
         board.board_tasks
              .active
+             .first_per_column(BoardTask::PAGE_SIZE)
              .select(Arel.sql(<<~SQL))
                board_tasks.*,
                (SELECT COUNT(*) FROM task_comments WHERE board_task_id = board_tasks.id) AS comments_count,
                (SELECT COUNT(*) FROM board_tasks children WHERE children.parent_task_id = board_tasks.id) AS children_count,
                (SELECT COUNT(*) FROM task_assets WHERE board_task_id = board_tasks.id) AS assets_count
              SQL
-             .includes(:assignee, :workflow_runs, :pending_gates)
-             .order(:position).map { |t| BoardTaskResource.new(t).to_h }
+             .includes(:assignee, :workflow_runs, :gates)
+             .in_board_order.map { |t| BoardTaskResource.new(t).to_h }
+      },
+      tasks_page_size: BoardTask::PAGE_SIZE,
+      # Filter options and the parent-epic picker used to be derived from the task
+      # payload; with only a page per column loaded they have to come from the board.
+      board_tags: -> { board.board_tasks.active.distinct.pluck(Arel.sql("unnest(tags)")).compact.sort },
+      epics: -> {
+        board.board_tasks.active.where(task_type: "epic").order(:title).limit(EPIC_OPTIONS_LIMIT)
+             .pluck(:id, :title).map { |id, title| { id: id, title: title } }
       },
       members: -> { current_project.member_users.map { |u| BoardMemberResource.new(u).to_h } },
       workflows: -> { current_project.workflows.order(:name).map { |w| BoardWorkflowResource.new(w).to_h } },
@@ -65,7 +82,9 @@ class Web::Company::Projects::BoardsController < Web::Company::Projects::Applica
       },
       task_workflow_runs: -> {
         next [] unless task
-        task.workflow_runs.includes(:workflow).order(created_at: :desc)
+        # step_runs: :step because the resource renders a row per step run; without the
+        # preload a task with a run history costs two queries per run.
+        task.workflow_runs.includes(:workflow, step_runs: :step).order(created_at: :desc)
             .map { |r| TaskWorkflowRunResource.new(r).to_h }
       },
       task_statistics: -> {
@@ -81,6 +100,9 @@ class Web::Company::Projects::BoardsController < Web::Company::Projects::Applica
       board_presets: -> { BoardPresets.all.map { |p| BoardPresetResource.new(p).to_h } },
       columns: [],
       tasks: [],
+      tasks_page_size: BoardTask::PAGE_SIZE,
+      board_tags: [],
+      epics: [],
       members: [],
       workflows: [],
       view_presets: [],
@@ -97,7 +119,7 @@ class Web::Company::Projects::BoardsController < Web::Company::Projects::Applica
 
   def find_task(board)
     board.board_tasks
-         .includes(:assignee, :parent_task, :child_tasks, :task_comments, :task_assets, :workflow_runs, :pending_gates)
+         .includes(:assignee, :parent_task, :child_tasks, :task_comments, :task_assets, :workflow_runs, :gates)
          .find_by(id: params[:task])
     # note: task_assets included here so TaskDetailResource.assets_count avoids N+1;
     # parent_task so TaskDetailResource.parent_task_title does not fire an extra query

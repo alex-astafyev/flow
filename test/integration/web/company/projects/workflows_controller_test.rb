@@ -17,6 +17,31 @@ class Web::Company::Projects::WorkflowsControllerTest < ActionDispatch::Integrat
     assert_inertia_page "Projects/Workflows/WorkflowsPage"
   end
 
+  # This page reported an N+1 from production: the steps of every workflow, plus the
+  # sub-steps of every step, were fetched one query at a time. The preload makes it two
+  # queries whatever the workflow count, so the assertion is on the shape of the load,
+  # not on a total that any unrelated change would move.
+  test "index loads steps and sub steps in a fixed number of queries" do
+    create_list(:workflow, 3, scope: @project).each do |workflow|
+      create_list(:step, 2, workflow: workflow).each { |step| create(:sub_step, step: step) }
+    end
+
+    queries = []
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+      queries << payload[:sql]
+    end
+
+    begin
+      get company_project_workflows_path(@project)
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
+    assert_response :success
+    assert_equal 1, queries.count { |sql| sql.match?(/FROM "steps"/) }, queries.grep(/FROM "steps"/).inspect
+    assert_equal 1, queries.count { |sql| sql.match?(/FROM "sub_steps"/) }, queries.grep(/FROM "sub_steps"/).inspect
+  end
+
   test "builder renders workflow builder" do
     wf = create(:workflow, scope: @project)
 
@@ -67,6 +92,31 @@ class Web::Company::Projects::WorkflowsControllerTest < ActionDispatch::Integrat
   test "create redirects on success" do
     post company_project_workflows_path(@project), params: { workflow: { name: "Proj WF", description: "D" } }
     assert_response :redirect
+  end
+
+  # The workflows page's Edit dialog PATCHes this path (WorkflowsPage.tsx), and its
+  # own Vitest coverage passes on a mocked `router.patch` — so a missing route here
+  # looked green on both sides while renaming a workflow in the UI did nothing.
+  test "update renames a workflow and edits its description" do
+    wf = create(:workflow, scope: @project, name: "Old name", description: "old description")
+
+    patch company_project_workflow_path(@project, wf),
+          params: { workflow: { name: "New name", description: "new description" } }
+    assert_response :redirect
+
+    wf.reload
+    assert_equal "New name", wf.name
+    assert_equal "new description", wf.description
+  end
+
+  test "update reports validation errors instead of renaming" do
+    create(:workflow, scope: @project, name: "Taken")
+    wf = create(:workflow, scope: @project, name: "Keeps its name")
+
+    patch company_project_workflow_path(@project, wf), params: { workflow: { name: "Taken" } }
+    assert_response :redirect
+
+    assert_equal "Keeps its name", wf.reload.name
   end
 
   test "destroy redirects on success" do

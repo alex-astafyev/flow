@@ -55,6 +55,29 @@ class Web::ProfileControllerTest < ActionDispatch::IntegrationTest
     assert_equal "en", other_membership.reload.preferred_agent_language
   end
 
+  # The usage panel reads Anthropic over HTTP. Deferring it is the contract that
+  # keeps a slow or throttled vendor off the profile page's critical path.
+  test "show defers the usage limits prop rather than blocking the render on the vendor" do
+    get profile_path
+
+    assert_inertia_deferred_props :usage_limits, group: "limits"
+    assert_inertia_props do |props|
+      !props.key?(:usageLimits)
+    end
+  end
+
+  test "the deferred usage limits prop resolves to an empty list when no credential bills against a plan" do
+    # Billed to the member's own AWS account, so there is no plan window to read
+    # — and no request to Anthropic to find that out.
+    create(:agent_credential, user: @user, company: @company, agent_type: "claude_code",
+                              config_data: { "awsBedrock" => { "region" => "us-east-1" } })
+
+    get profile_path
+    inertia_load_deferred_props("limits")
+
+    assert_inertia_props usageLimits: []
+  end
+
   test "update_default_model redirects on success" do
     credential = create(:agent_credential, user: @user)
 
@@ -98,6 +121,66 @@ class Web::ProfileControllerTest < ActionDispatch::IntegrationTest
 
     assert_response :not_found
     assert AgentCredential.exists?(credential.id)
+  end
+
+  # ── the MCP tab ──
+
+  test "mcp renders its own page with the connection details and the tool catalog" do
+    get mcp_profile_path
+
+    assert_inertia_page "Profile/Mcp"
+    assert_inertia_props do |props|
+      assert_equal "flow", props[:mcp][:serverName]
+      assert_equal Tools::PersonalMCP.public_url, props[:mcp][:serverUrl]
+      # No selection yet: the client renders "everything", including tools
+      # added after this page was last opened.
+      assert_nil props[:mcp][:enabledTools]
+      assert_includes props[:mcp][:toolGroups].flat_map { |g| g[:tools] }.map { |t| t[:name] }, "list_projects"
+    end
+  end
+
+  # The token exists exactly once, in the response to the regeneration itself —
+  # so the redirect has to land on the page that renders it.
+  test "regenerate_mcp_token redirects to the mcp tab and shows the token once" do
+    post regenerate_mcp_token_profile_path
+
+    assert_redirected_to mcp_profile_path
+    follow_redirect!
+    assert_inertia_props { |props| assert props[:mcp][:token].starts_with?(User::MCP_TOKEN_PREFIX) }
+
+    get mcp_profile_path
+    assert_inertia_props { |props| assert_nil props[:mcp][:token] }
+  end
+
+  test "disable_mcp_token redirects to the mcp tab" do
+    @user.regenerate_mcp_token!
+
+    delete disable_mcp_token_profile_path
+
+    assert_redirected_to mcp_profile_path
+    assert_not @user.reload.mcp_enabled?
+  end
+
+  test "update_mcp_tools stores the selection and drops names the registry does not know" do
+    patch update_mcp_tools_profile_path, params: { toolNames: %w[list_projects not_a_tool] }, as: :json
+
+    assert_redirected_to mcp_profile_path
+    assert_equal %w[list_projects], @user.reload.mcp_enabled_tools
+  end
+
+  test "update_mcp_tools stores a full selection as 'everything'" do
+    @user.update!(mcp_enabled_tools: %w[list_projects])
+
+    patch update_mcp_tools_profile_path,
+          params: { toolNames: Tools::Registry.for_audience(:user).map(&:name) }, as: :json
+
+    assert_nil @user.reload.mcp_enabled_tools
+  end
+
+  test "update_mcp_tools accepts an empty selection" do
+    patch update_mcp_tools_profile_path, params: { toolNames: [] }, as: :json
+
+    assert_empty @user.reload.mcp_enabled_tools
   end
 
   private

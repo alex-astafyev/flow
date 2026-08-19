@@ -4,9 +4,10 @@ module PersonalTools
   class GetWorkflowStep < Base
     tool do
       display_name "Get Workflow Step"
-      description "Return one workflow step in full: the complete, untruncated instructions plus every " \
-                  "wiring field (agent, tools, skills, MCP servers, dependencies, BMAD, retries, assets) " \
-                  "and its sub-steps. Use this before editing a step — get_workflow truncates instructions."
+      description "Return one workflow step with every wiring field (agent, tools, skills, MCP servers, " \
+                  "config items, dependencies, BMAD, retries, failure and skip policy, preferred model, " \
+                  "asset specs) and its sub-steps. get_workflow already carries instructions in full; " \
+                  "this adds the fields it leaves out."
       audience :user
       tags :workflows
       read_only
@@ -25,6 +26,7 @@ module PersonalTools
               instructions: step.instructions,
               agent: step.agent && { id: step.agent.id, title: step.agent.title },
               tool_ids: step.tool_ids, skill_ids: step.skill_ids, mcp_server_ids: step.mcp_server_ids,
+              config_item_ids: step.config_item_ids,
               depends_on_step_ids: step.depends_on_step_ids,
               bmad_enabled: step.bmad_enabled, allow_non_interactive: step.allow_non_interactive,
               max_retries: step.max_retries, on_failure: step.on_failure.to_s,

@@ -13,6 +13,8 @@ import {
 } from '@tabler/icons-react';
 import { useState } from 'react';
 
+import type { ConfigItemPicker } from '@/types/generated';
+
 import classes from './BuilderPage.module.css';
 
 interface NamedItem {
@@ -40,6 +42,7 @@ interface Step {
   position: number;
   agentId: number | null;
   requiredAgentRuntime: string | null;
+  preferredModel: string | null;
   allowNonInteractive: boolean;
   skipPolicy: string;
   onFailure: string;
@@ -50,6 +53,7 @@ interface Step {
   skillIds: number[];
   assetIds: number[];
   repositoryIds: number[];
+  configItemIds: number[];
   inputAssetSpecs: AssetSpec[];
   outputAssetSpecs: AssetSpec[];
 }
@@ -155,6 +159,15 @@ function AssetRows({ specs, onChange, showNamePattern, disabled, kind }: AssetRo
 
 const GROUP_PREFIX = 'grp:';
 
+interface AgentModel {
+  modelId: string;
+  displayName: string;
+}
+interface AgentModelsEntry {
+  agentType: string;
+  models: AgentModel[];
+}
+
 interface SessionEditorPanelProps {
   step: Step;
   allSteps: Step[];
@@ -165,6 +178,8 @@ interface SessionEditorPanelProps {
   mcpServers: NamedItem[];
   assets: NamedItem[];
   repositories: NamedItem[];
+  configItems: ConfigItemPicker[];
+  agentModels?: AgentModelsEntry[];
   readOnly: boolean;
   onFieldChange: (field: string, value: unknown, immediate?: boolean) => void;
   onAssetSpecsChange: (field: 'inputAssetSpecs' | 'outputAssetSpecs', specs: AssetSpec[]) => void;
@@ -180,12 +195,30 @@ export function SessionEditorPanel({
   mcpServers,
   assets,
   repositories,
+  configItems,
+  agentModels = [],
   readOnly,
   onFieldChange,
   onAssetSpecsChange,
 }: SessionEditorPanelProps) {
   const [instructionsExpanded, setInstructionsExpanded] = useState(false);
   const charCount = (step.instructions ?? '').length;
+
+  const modelsMap: Record<string, AgentModel[]> = {};
+  for (const entry of agentModels) modelsMap[entry.agentType] = entry.models;
+  const runtimeModels = step.requiredAgentRuntime ? (modelsMap[step.requiredAgentRuntime] ?? []) : [];
+  const modelOptions = runtimeModels
+    .filter((m) => m.modelId)
+    .map((m) => ({ value: m.modelId, label: m.displayName || m.modelId }));
+  const preferredModelOptions =
+    step.preferredModel && !modelOptions.some((o) => o.value === step.preferredModel)
+      ? [...modelOptions, { value: step.preferredModel, label: step.preferredModel }]
+      : modelOptions;
+
+  const stepConfigItemIds = step.configItemIds ?? [];
+  const configItemSelectData = (Array.isArray(configItems) ? configItems : [])
+    .filter((c) => c?.id != null)
+    .map((c) => ({ value: String(c.id), label: c.itemType === 'secret' ? `${c.name} (secret)` : c.name }));
 
   const groupedToolIds = new Set(toolGroups.flatMap((g) => g.toolIds));
   const toolSelectData = [
@@ -337,9 +370,15 @@ export function SessionEditorPanel({
                 { value: 'cursor_cli', label: 'Cursor CLI' },
                 { value: 'codex', label: 'Codex' },
                 { value: 'gemini_cli', label: 'Gemini CLI' },
+                { value: 'grok', label: 'Grok' },
               ]}
               value={step.requiredAgentRuntime ?? ''}
-              onChange={(v) => onFieldChange('requiredAgentRuntime', v || null, true)}
+              onChange={(v) => {
+                const runtime = v || null;
+                if (runtime === step.requiredAgentRuntime) return;
+                onFieldChange('requiredAgentRuntime', runtime, true);
+                if (step.preferredModel) onFieldChange('preferredModel', null, true);
+              }}
               disabled={readOnly}
               clearable
               placeholder="None (default)"
@@ -355,6 +394,38 @@ export function SessionEditorPanel({
               }}
             />
           </div>
+          {step.requiredAgentRuntime && (
+            <div>
+              <label className={classes.fieldLabel}>
+                Preferred Model&nbsp;
+                <span
+                  title="Overrides the runtime's default model for this session."
+                  style={{ color: 'var(--text-3)', cursor: 'help' }}
+                >
+                  <IconInfoCircle size={11} style={{ display: 'inline', verticalAlign: 'middle' }} />
+                </span>
+              </label>
+              <Select
+                data={preferredModelOptions}
+                value={step.preferredModel ?? null}
+                onChange={(v) => onFieldChange('preferredModel', v || null, true)}
+                disabled={readOnly}
+                clearable
+                searchable
+                placeholder="Default (runtime selects)"
+                aria-label="Preferred model"
+                styles={{
+                  input: {
+                    background: 'transparent',
+                    border: '1px solid var(--border)',
+                    borderRadius: 4,
+                    color: 'var(--text-1)',
+                    fontSize: 13,
+                  },
+                }}
+              />
+            </div>
+          )}
         </div>
       </div>
 
@@ -432,6 +503,24 @@ export function SessionEditorPanel({
             searchable
             placeholder="None added"
             aria-label="Assets"
+            styles={{
+              input: { background: 'transparent', border: '1px solid var(--border)', borderRadius: 4, fontSize: 13 },
+            }}
+          />
+        </div>
+
+        <div className={classes.resGroup}>
+          <div className={classes.resType}>
+            Secrets &amp; Variables <span className={classes.resTypeSub}>— read on demand with get_config_item</span>
+          </div>
+          <MultiSelect
+            data={configItemSelectData}
+            value={toStringArr(stepConfigItemIds)}
+            onChange={(v) => onFieldChange('configItemIds', toNumberArr(v), true)}
+            disabled={readOnly}
+            searchable
+            placeholder="None added"
+            aria-label="Secrets and variables"
             styles={{
               input: { background: 'transparent', border: '1px solid var(--border)', borderRadius: 4, fontSize: 13 },
             }}
